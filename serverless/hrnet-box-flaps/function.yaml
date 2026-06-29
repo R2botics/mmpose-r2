@@ -1,0 +1,46 @@
+apiVersion: "nuclio.io/v1beta1"
+kind: "Function"
+metadata:
+  name: "hrnet-box-flaps"
+  namespace: "cvat"
+  annotations:
+    name: HRNet Box Flaps
+    type: detector
+    spec: |
+      [
+        {
+          "id": 1,
+          "name": "Box_Flaps",
+          "type": "skeleton",
+          "sublabels": [
+            {"name": "NORTH_1"},
+            {"name": "NORTH_2"},
+            {"name": "EAST_1"},
+            {"name": "EAST_2"},
+            {"name": "SOUTH_1"},
+            {"name": "SOUTH_2"},
+            {"name": "WEST_1"},
+            {"name": "WEST_2"}
+          ]
+        }
+      ]
+spec:
+  description: "HRNet-W32 box flap keypoint detector"
+  runtime: "python:3.8"
+  handler: handler:handler
+  eventTimeout: "30s"
+  build:
+    image: "cvat/hrnet-box-flaps:latest"
+    noBaseImagesPull: true
+  triggers:
+    myHttpTrigger:
+      maxWorkers: 1
+      kind: "http"
+      workerAvailabilityTimeoutMilliseconds: 10000
+      attributes:
+        maxRequestBodySize: 33554432
+  platform:
+    attributes:
+      restartPolicy:
+        name: always
+        maximumRetryCount: 3

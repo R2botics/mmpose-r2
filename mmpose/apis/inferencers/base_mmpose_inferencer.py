@@ -182,15 +182,15 @@ class BaseMMPoseInferencer(BaseInferencer):
                 ]
                 inputs = []
                 for filepath in filepath_list:
-                    input_type = mimetypes.guess_type(filepath)[0].split(
-                        '/')[0]
-                    if input_type == 'image':
+                    mime = mimetypes.guess_type(filepath)[0]
+                    if mime is not None and mime.split('/')[0] == 'image':
                         inputs.append(filepath)
                 inputs.sort()
             else:
                 # if inputs is a path to a video file, it will be converted
                 # to a list containing separated frame filenames
-                input_type = mimetypes.guess_type(inputs)[0].split('/')[0]
+                mime = mimetypes.guess_type(inputs)[0]
+                input_type = mime.split('/')[0] if mime is not None else ''
                 if input_type == 'video':
                     self._video_input = True
                     video = mmcv.VideoReader(inputs)
@@ -302,7 +302,19 @@ class BaseMMPoseInferencer(BaseInferencer):
         scope = cfg.get('default_scope', 'mmpose')
         if scope is not None:
             init_default_scope(scope)
-        return Compose(cfg.test_dataloader.dataset.pipeline)
+        if cfg.get('test_dataloader') is not None:
+            pipeline = cfg.test_dataloader.dataset.pipeline
+        else:
+            pipeline = [
+                dict(type='LoadImage'),
+                dict(type='GetBBoxCenterScale'),
+                dict(
+                    type='TopdownAffine',
+                    input_size=cfg.model.head.get('input_size', (256, 256)),
+                    use_udp=True),
+                dict(type='PackPoseInputs')
+            ]
+        return Compose(pipeline)
 
     def update_model_visualizer_settings(self, **kwargs):
         """Update the settings of models and visualizer according to inference

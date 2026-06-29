@@ -1,0 +1,12 @@
+path: /home/siddharth/Deps/mmpose/yolo_dataset
+train: images/train
+val: images/val
+
+kpt_shape: [8, 3]   # 8 keypoints, 3 values (x, y, visibility)
+
+# Symmetric flip pairs (left-right swap on horizontal flip)
+# We disable flip in training (EAST/WEST are fixed) so this is just metadata
+flip_idx: [1, 0, 7, 6, 5, 4, 3, 2]
+
+names:
+  0: Box_Flaps

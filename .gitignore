@@ -130,5 +130,17 @@ docs/**/modelzoo.md
 
 # Pytorch
 *.pth
+*.pt
+
+# Datasets and converted formats
+/yolo_dataset/images/
+/yolo_dataset/labels/
+
+# YOLO/Ultralytics output
+/runs/
+
+# Stray visualization outputs
+vis_results.jpg
+vis_results.png
 
 *.DS_Store
