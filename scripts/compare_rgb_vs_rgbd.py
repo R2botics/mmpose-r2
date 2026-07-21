@@ -29,10 +29,11 @@ import mmpose.models.losses.geometric_loss        # noqa: F401
 
 from mmpose.apis import init_model
 
-RGB_CFG               = 'configs/hrnet-w32_8-kp_udp.py'
-RGBD_CFG              = 'configs/hrnet-w32_8-kp_udp_rgbd.py'
-RGBD_GEOM_CFG         = 'configs/hrnet-w32_8-kp_udp_rgbd_geom.py'
-RGBD_GEOM_SCRATCH_CFG = 'configs/hrnet-w32_8-kp_udp_rgbd_geom_scratch.py'
+RGB_CFG                = 'configs/hrnet-w32_8-kp_udp.py'
+RGBD_CFG               = 'configs/hrnet-w32_8-kp_udp_rgbd.py'
+RGBD_GEOM_CFG          = 'configs/hrnet-w32_8-kp_udp_rgbd_geom.py'
+RGBD_GEOM_SCRATCH_CFG  = 'configs/hrnet-w32_8-kp_udp_rgbd_geom_scratch.py'
+RGBD_GEOM_COMBINED_CFG = 'configs/hrnet-w32_8-kp_udp_rgbd_geom_combined.py'
 
 
 # -- Skeleton drawing -------------------------------------------------------
@@ -132,6 +133,13 @@ def main():
     parser.add_argument('--input-dir',
                         default='data/test_OOD',
                         help='Folder with images/ and depth/ subfolders')
+    parser.add_argument('--image',
+                        default=None,
+                        help='Path to a single color image. If set, only this '
+                             'image is processed (and --input-dir is ignored). '
+                             'The matching depth file is found by replacing '
+                             '_cropped_color.png with _aligned_depth.png and '
+                             'looking in a sibling depth/ folder.')
     parser.add_argument('--rgb-checkpoint',
                         default='work_dirs/hrnet_udp_test_01/best_coco_AP_epoch_40.pth')
     parser.add_argument('--rgbd-checkpoint',
@@ -140,6 +148,8 @@ def main():
                         default='work_dirs/hrnet_udp_rgbd_geom_test_01/best_coco_AP_epoch_30.pth')
     parser.add_argument('--rgbd-geom-scratch-checkpoint',
                         default='work_dirs/hrnet_udp_rgbd_geom_scratch_test_01/best_coco_AP_epoch_510.pth')
+    parser.add_argument('--rgbd-geom-combined-checkpoint',
+                        default='work_dirs/hrnet_udp_rgbd_geom_combined_test_02/best_coco_AP_epoch_30.pth')
     parser.add_argument('--out-dir', required=True)
     parser.add_argument('--kpt-thr', type=float, default=0.3)
     parser.add_argument('--device', default='cuda:0')
@@ -152,6 +162,7 @@ def main():
     (out_root / 'rgbd').mkdir(parents=True, exist_ok=True)
     (out_root / 'rgbd_geom').mkdir(parents=True, exist_ok=True)
     (out_root / 'rgbd_geom_scratch').mkdir(parents=True, exist_ok=True)
+    (out_root / 'rgbd_geom_combined').mkdir(parents=True, exist_ok=True)
     (out_root / 'side_by_side').mkdir(parents=True, exist_ok=True)
 
     # Load all three models
@@ -176,10 +187,23 @@ def main():
         scratch_cfg, args.rgbd_geom_scratch_checkpoint, device=args.device)
     scratch_pipeline = build_pipeline(scratch_cfg, with_depth=True)
 
-    # Process all color images
-    input_dir = Path(args.input_dir)
-    color_paths = sorted((input_dir / 'images').glob('*_cropped_color.png'))
-    print(f'Processing {len(color_paths)} images...')
+    print('Loading RGBD+Geom (combined real+synth) model...')
+    combined_cfg = Config.fromfile(RGBD_GEOM_COMBINED_CFG)
+    combined_model = init_model(
+        combined_cfg, args.rgbd_geom_combined_checkpoint, device=args.device)
+    combined_pipeline = build_pipeline(combined_cfg, with_depth=True)
+
+    # Decide whether to process a single image or a whole folder
+    if args.image:
+        color_paths = [Path(args.image)]
+        # input_dir used later to find the depth file by name pattern
+        input_dir = color_paths[0].parent.parent
+        print(f'Processing single image: {color_paths[0]}')
+    else:
+        input_dir = Path(args.input_dir)
+        color_paths = sorted(
+            (input_dir / 'images').glob('*_cropped_color.png'))
+        print(f'Processing {len(color_paths)} images from {input_dir}')
 
     for color_path in color_paths:
         # 3 model inferences on the same color image
@@ -199,45 +223,52 @@ def main():
             scratch_model, scratch_pipeline, color_path)
         scratch_viz = draw_pose(color, scratch_kpts, scratch_scores, args.kpt_thr)
 
+        combined_kpts, combined_scores, _ = run_inference(
+            combined_model, combined_pipeline, color_path)
+        combined_viz = draw_pose(color, combined_kpts, combined_scores, args.kpt_thr)
+
         # Depth visualization
         depth_path = (input_dir / 'depth' /
                       color_path.name.replace('_cropped_color.png',
                                               '_aligned_depth.png'))
         depth_viz = render_depth(depth_path, color)
 
-        # 5-panel side-by-side: RGB | RGBD | RGBD+Geom | RGBD+Geom(scratch) | Depth
+        # 6-panel side-by-side: RGB | RGBD | Geom | Geom+Synth | Geom(scratch) | Depth
         h, w = color.shape[:2]
         gap = np.full((h, 10, 3), 255, dtype=np.uint8)
         sbs = np.concatenate(
             [rgb_viz, gap, rgbd_viz, gap, geom_viz, gap,
-             scratch_viz, gap, depth_viz], axis=1)
+             combined_viz, gap, scratch_viz, gap, depth_viz], axis=1)
 
         # Header with labels positioned over each panel
         header = np.full((30, sbs.shape[1], 3), 50, dtype=np.uint8)
         labels = [
-            ('RGB UDP',          10),
-            ('RGBD',             w + 20),
-            ('RGBD + Geom',      2 * w + 30),
-            ('Geom (scratch)',   3 * w + 40),
-            ('Depth (norm)',     4 * w + 50),
+            ('RGB UDP',           10),
+            ('RGBD',              w + 20),
+            ('RGBD+Geom',         2 * w + 30),
+            ('RGBD+Geom+Synth',   3 * w + 40),
+            ('Geom (scratch)',    4 * w + 50),
+            ('Depth (norm)',      5 * w + 60),
         ]
         for text, x in labels:
             cv2.putText(header, text, (x, 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         sbs = np.concatenate([header, sbs], axis=0)
 
-        cv2.imwrite(str(out_root / 'rgb'               / color_path.name), rgb_viz)
-        cv2.imwrite(str(out_root / 'rgbd'              / color_path.name), rgbd_viz)
-        cv2.imwrite(str(out_root / 'rgbd_geom'         / color_path.name), geom_viz)
-        cv2.imwrite(str(out_root / 'rgbd_geom_scratch' / color_path.name), scratch_viz)
-        cv2.imwrite(str(out_root / 'side_by_side'      / color_path.name), sbs)
+        cv2.imwrite(str(out_root / 'rgb'                / color_path.name), rgb_viz)
+        cv2.imwrite(str(out_root / 'rgbd'               / color_path.name), rgbd_viz)
+        cv2.imwrite(str(out_root / 'rgbd_geom'          / color_path.name), geom_viz)
+        cv2.imwrite(str(out_root / 'rgbd_geom_scratch'  / color_path.name), scratch_viz)
+        cv2.imwrite(str(out_root / 'rgbd_geom_combined' / color_path.name), combined_viz)
+        cv2.imwrite(str(out_root / 'side_by_side'       / color_path.name), sbs)
 
     print(f'Done. Output in {out_root}/')
-    print(f'  rgb/                 - RGB UDP predictions')
-    print(f'  rgbd/                - RGBD predictions')
-    print(f'  rgbd_geom/           - RGBD+Geom (pretrained) predictions')
-    print(f'  rgbd_geom_scratch/   - RGBD+Geom (from scratch) predictions')
-    print(f'  side_by_side/        - all five panels stitched')
+    print(f'  rgb/                  - RGB UDP predictions')
+    print(f'  rgbd/                 - RGBD predictions')
+    print(f'  rgbd_geom/            - RGBD+Geom (real-only) predictions')
+    print(f'  rgbd_geom_combined/   - RGBD+Geom (real+synth) predictions')
+    print(f'  rgbd_geom_scratch/    - RGBD+Geom (from scratch) predictions')
+    print(f'  side_by_side/         - all six panels stitched (5 models + depth)')
 
 
 if __name__ == '__main__':
