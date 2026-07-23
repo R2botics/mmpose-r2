@@ -1,0 +1,25 @@
+name: mmpose-r2
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - git
+  - numpy<2
+  - pytorch=2.1.*
+  - torchvision=0.16.*
+  - pytorch-cuda=12.1
+  - pip:
+      - openmim
+      - json_tricks
+      - matplotlib
+      - munkres
+      - opencv-python
+      - pillow
+      - scipy
+      - future
+      - tensorboard
+      - mlflow
+      - xtcocotools>=1.12
