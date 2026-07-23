@@ -1,17 +1,12 @@
 _base_ = ['./hrnet-w32_8-kp_udp_rgbd_geom.py']
 
-# STAGE 1 of two-stage training: pretrain on synthetic data only.
-# Model starts from the 5-channel ImageNet-inflated backbone and learns
-# to detect box corners on the diverse synthetic distribution. The
-# resulting checkpoint feeds into the stage-2 config which fine-tunes on
-# real data.
+# STAGE 1 of two-stage training: pretrain on ~10K synthetic samples.
 #
-# Watch: val AP here will be lower than real-only training because
-# validation happens on the REAL val set — this measures how well
-# synthetic-learned features transfer to real, which is exactly the
-# question we want stage 2 to answer.
+# At this scale, the model won't just memorize the synthetic set — it should
+# learn genuinely transferable features. Training dynamics change vs the
+# 168-sample first attempt: longer warmup, more epochs before overfitting.
 
-# MLflow — separate run for the two-stage story
+# Register custom modules + MLflow
 custom_imports = dict(
     imports=[
         'mmpose.datasets.transforms.rgbd',
@@ -27,13 +22,13 @@ vis_backends = [
     dict(
         type='SafeMLflowVisBackend',
         exp_name='box-flap-pose',
-        run_name='rgbd-geom-synth-pretrain',
+        run_name='rgbd-geom-synth-pretrain-10k',
         tracking_uri='http://10.200.104.2:31016',
         tags=dict(
             model='hrnet-w32',
             variant='rgbd-geom',
             data='synthetic-only',
-            train_size='168',
+            train_size='10000',
             stage='pretrain',
             backbone_init='imagenet'),
         artifact_suffix=['.py', '.pth', '.json']),
@@ -43,28 +38,31 @@ visualizer = dict(
     vis_backends=vis_backends,
     name='visualizer')
 
-# Train on synthetic only. The synthetic images are symlinked under
-# data/RSC_Keypoints_RGBD/images/synthetic/ and depth/synthetic/, and the
-# annotation JSON references those paths.
+# Train on synthetic only. Assumes the ~10K annotation file is at
+# annotations/person_keypoints_synth_only.json and the images/depth are
+# symlinked under images/synthetic/ and depth/synthetic/ (same layout as before).
 train_dataloader = dict(
+    batch_size=32,           # 2x default — 10K samples benefits from bigger batches
+    num_workers=8,           # more workers to keep GPU fed
     dataset=dict(
         ann_file='annotations/person_keypoints_synth_only.json'))
 
-# Fewer epochs — synthetic is smaller and more homogeneous than real+synth.
-# 200 epochs at 168/batch=16 = ~2100 iterations. Long enough to converge
-# but short enough that we don't over-specialize on synthetic.
-train_cfg = dict(by_epoch=True, max_epochs=200, val_interval=10)
+# At 10K/batch 32 = 313 iters per epoch. 100 epochs = 31,300 iters total.
+# Model shouldn't overfit at this data scale until much later than 168-sample
+# case (which peaked at epoch 20). Give it room to learn.
+train_cfg = dict(by_epoch=True, max_epochs=100, val_interval=10)
 
-# Adjust the geometric-loss warmup to a shorter schedule.
-# At 168 images / batch 16 = ~11 iters/epoch, so 1100 steps ≈ 100 epochs.
+# Geometric-loss warmup at the new scale:
+#   313 iters/epoch × 50 epochs = 15,650 warmup steps
+# Ramps geometric weight from 0 -> 1 over the first half of training.
 model = dict(
     head=dict(
-        loss=dict(warmup_steps=1100)))
+        loss=dict(warmup_steps=15650)))
 
-# Scale the cosine schedule to the new epoch count.
+# Cosine schedule matched to the new epoch count.
 param_scheduler = [
     dict(type='LinearLR', start_factor=1.0e-5, by_epoch=False,
-         begin=0, end=100),
-    dict(type='CosineAnnealingLR', eta_min=0, begin=0, end=200,
+         begin=0, end=1000),          # ~3 epochs of LR warmup
+    dict(type='CosineAnnealingLR', eta_min=0, begin=0, end=100,
          by_epoch=True),
 ]
