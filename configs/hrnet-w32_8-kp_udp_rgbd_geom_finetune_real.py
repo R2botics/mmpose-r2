@@ -40,7 +40,7 @@ visualizer = dict(
 
 # Load the full model (backbone + head + preprocessor buffers) from stage 1.
 # Update this path after stage 1 completes and you know its best epoch.
-load_from = 'work_dirs/hrnet_synth_pretrain_test_01/best_coco_AP_epoch_20.pth'
+load_from = 'work_dirs/hrnet_synth_pretrain_test_02/best_coco_AP_epoch_70.pth'
 resume = False
 
 # Train on real data only (same 288 train / 72 val split used everywhere else).
