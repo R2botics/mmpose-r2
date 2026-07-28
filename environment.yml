@@ -7,19 +7,67 @@ dependencies:
   - python=3.10
   - pip
   - git
+  # numpy 2.x breaks mmcv 2.x and xtcocotools — must stay on 1.x
   - numpy<2
+  # setuptools 81+ drops pkg_resources, which mmengine 0.10.x still imports in
+  # utils/package_utils.py:is_installed() — hit by every config that inherits
+  # through the `mmpose::` scope, i.e. all of configs/.
+  - setuptools<81
   - pytorch=2.1.*
   - torchvision=0.16.*
   - pytorch-cuda=12.1
   - pip:
-      - openmim
+      # Repeat of the conda-side pin, and NOT redundant: pip runs after the
+      # conda solve with its own resolver, which does not see conda's
+      # constraints. Without this line an unpinned dependency below pulls
+      # numpy 2.x and *uninstalls* the conda numpy 1.26.4 — which breaks the
+      # mmcv and xtcocotools C extensions (both built against the 1.x ABI).
+      - numpy<2
+
+      # ---- OpenMMLab core -------------------------------------------------
+      # mmcv MUST come from the OpenMMLab wheel index. The PyPI sdist compiles
+      # CUDA ops from source (~30 min, frequently fails). This index carries a
+      # prebuilt cp310 wheel for torch2.1 + cu121.
+      #
+      # Pinned to 2.1.0, NOT 2.2.0: mmdet 3.x asserts mmcv < 2.2.0, and mmdet
+      # is a hard import (mmpose/models/heads/hybrid_heads/rtmo_head.py:9
+      # imports it unguarded), so mmcv 2.2.0 breaks `import mmpose`.
+      - --find-links https://download.openmmlab.com/mmcv/dist/cu121/torch2.1/index.html
+      - mmcv==2.1.0
+      - mmengine>=0.10.0,<1.0.0
+      # Unused by the box-flap pipeline (bboxes are full-image, no detector
+      # stage) but required at import time by rtmo_head.
+      - mmdet>=3.2.0,<3.3.0
+
+      # ---- mmpose runtime -------------------------------------------------
       - json_tricks
       - matplotlib
       - munkres
-      - opencv-python
+      # opencv-python 5.x hard-requires numpy>=2, so it silently drags numpy
+      # 2.x in and clobbers the pin above. 4.11 is the newest 4.x that
+      # resolves against numpy 1.26.
+      - opencv-python<5
       - pillow
       - scipy
-      - future
-      - tensorboard
-      - mlflow
+      # COCO keypoint eval — backs `val_evaluator = dict(type='CocoMetric')`
       - xtcocotools>=1.12
+
+      # ---- experiment tracking --------------------------------------------
+      # tensorboard is NOT optional: every config in configs/ declares
+      # TensorboardVisBackend, and mmengine imports torch.utils.tensorboard.
+      - tensorboard
+      # SafeMLflowVisBackend — used by the combined / synth_pretrain /
+      # finetune_real configs.
+      - mlflow
+
+      # ---- analysis & export scripts --------------------------------------
+      # scripts/tsne_real_vs_synth.py (TSNE, LogisticRegression, cross_val_score)
+      - scikit-learn
+      # scripts/export_rgbd_to_onnx.py — guarded by try/except, but without
+      # these you lose graph validation and the PyTorch-vs-ONNX parity check.
+      - onnx
+      - onnxruntime
+
+# NOTE: mmpose itself is installed editable (`pip install -e .`) by
+# scripts/setup_env.sh — it is not listed here because a relative path would
+# resolve against the caller's working directory, not this file's location.
