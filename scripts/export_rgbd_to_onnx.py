@@ -81,6 +81,21 @@ def main():
                         help='Use cpu for export — guarantees no CUDA-only ops slip in')
     args = parser.parse_args()
 
+    # Fail fast and legibly. torch.onnx.export imports `onnx` internally
+    # (onnx_proto_utils._add_onnxscript_fn), so a missing onnx surfaces as an
+    # OnnxExporterError from deep inside torch *after* the checkpoint has been
+    # loaded and the sanity forward has run — which reads like an export bug
+    # rather than a missing dependency.
+    try:
+        import onnx  # noqa: F401
+    except ImportError:
+        raise SystemExit(
+            'onnx is required to export (torch.onnx.export imports it '
+            'internally), but it is not installed.\n'
+            '    pip install onnx onnxruntime "numpy<2"\n'
+            'Keep the numpy pin: an unconstrained install pulls numpy 2.x, '
+            'which breaks the mmcv and xtcocotools C extensions.')
+
     init_default_scope('mmpose')
 
     print(f'Loading config: {args.config}')

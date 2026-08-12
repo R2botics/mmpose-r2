@@ -63,9 +63,14 @@ dependencies:
       # ---- analysis & export scripts --------------------------------------
       # scripts/tsne_real_vs_synth.py (TSNE, LogisticRegression, cross_val_score)
       - scikit-learn
-      # scripts/export_rgbd_to_onnx.py — guarded by try/except, but without
-      # these you lose graph validation and the PyTorch-vs-ONNX parity check.
+      # scripts/export_rgbd_to_onnx.py.
+      # onnx is REQUIRED, not optional: torch.onnx.export imports it internally
+      # (torch/onnx/_internal/onnx_proto_utils.py::_add_onnxscript_fn) and
+      # raises OnnxExporterError without it. The script's try/except only
+      # guards the post-export validation, which runs after the failure point.
       - onnx
+      # onnxruntime genuinely is optional — it only powers the
+      # PyTorch-vs-ONNX parity check.
       - onnxruntime
 
 # NOTE: mmpose itself is installed editable (`pip install -e .`) by
