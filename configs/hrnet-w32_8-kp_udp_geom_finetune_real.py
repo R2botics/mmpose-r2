@@ -42,7 +42,7 @@ visualizer = dict(
     name='visualizer')
 
 # PLACEHOLDER — update to stage 1's best checkpoint before running.
-load_from = 'work_dirs/hrnet_rgb_synth_pretrain/best_coco_AP_epoch_100.pth'
+load_from = 'work_dirs/hrnet_rgb_synth_pretrain/best_coco_AP_epoch_40.pth'
 resume = False
 
 # Real data only — same 288 train / 72 val split used everywhere else.
