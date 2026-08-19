@@ -71,7 +71,7 @@ vis_backends = [
             model='hrnet-w32',
             variant='rgbd-geom',
             data='real+chewy2',
-            train_size='288+70(x2)',
+            train_size='288+140(x1)',
             stage='finetune-real+chewy2',
             backbone_init='synthetic-pretrained'),
         artifact_suffix=['.py', '.pth', '.json']),
@@ -128,17 +128,21 @@ train_dataloader = dict(
             _subset(rsc_root, 'annotations/person_keypoints_train.json'),
             _subset(chewy_root, 'annotations/person_keypoints_Train.json'),
         ],
-        # [RSC, Chewy] -- oversample the 70 new images 2x -> ~33% of the batch.
-        # Lower than it would be for a short continuation run: over 150 epochs
-        # a 3x factor shows each Chewy image ~450 times, which overfits 70
-        # images. Raise it if the Chewy pre-labels come out weak, lower it
-        # toward 1.0 if val AP sags.
-        sample_ratio_factor=[1.0, 2.0],
+        # [RSC, Chewy]. The factor exists to hold Chewy's SHARE of each batch
+        # roughly constant as the set grows -- so it must come down every time
+        # more Chewy images are labelled, or the balance silently drifts:
+        #     70 imgs x 2.0 = 140 effective -> 32.7% of the batch  (round 1)
+        #    140 imgs x 1.0 = 140 effective -> 32.7% of the batch  (round 2, here)
+        #    140 imgs x 2.0 = 280 effective -> 49.3%  <- what leaving it at 2.0 does
+        # 32.7% is the ratio that produced val 0.9491 / OOD PCK 97.5%, so keep
+        # it there and let the DATA be the only thing that changed.
+        # Rule of thumb for the next round: factor ~= 140 / n_chewy_images.
+        sample_ratio_factor=[1.0, 1.0],
         pipeline=train_pipeline))
 
 # Validation stays on the ORIGINAL real val split, and a plain CocoDataset,
 # because CocoMetric needs a single ann_file. It does NOT measure Chewy
-# performance — nothing does, since all 70 labelled Chewy images are in train.
+# performance — nothing does, since all 140 labelled Chewy images are in train.
 # Its job is to catch forgetting: if coco/AP falls well below the ~0.94
 # stage-2 plateau (~0.94), something is wrong. It should land in the same
 # range as stage 2, since this IS stage 2 with extra data.

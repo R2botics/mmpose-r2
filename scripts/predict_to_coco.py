@@ -105,6 +105,16 @@ def main():
                         'counted (default 10, matching the training loss)')
     p.add_argument('--flag-score', type=float, default=0.5,
                    help='Keypoints below this score are flagged for review')
+    p.add_argument('--oob', choices=['drop', 'clip', 'keep'], default='drop',
+                   help="How to handle keypoints predicted outside the image. "
+                        "'drop' marks them visibility=0 (default) so CVAT "
+                        "shows them as not-present, matching how an annotator "
+                        "marks an invisible corner; 'clip' pins them to the "
+                        "border and keeps them visible; 'keep' writes the raw "
+                        "out-of-bounds coordinate.")
+    p.add_argument('--oob-margin', type=float, default=0.0,
+                   help='Slack in pixels before a keypoint counts as out of '
+                        'bounds (default 0).')
     p.add_argument('--mark-low-score-occluded', action='store_true',
                    help='Write visibility=1 instead of 2 for keypoints below '
                         '--flag-score, so CVAT shows them as occluded')
@@ -146,11 +156,28 @@ def main():
         kpts, scores, color = run_inference(model, pipeline, cp)
         h, w = color.shape[:2]
 
-        flat, n_labelled = [], 0
+        flat, n_oob = [], 0
+        m = args.oob_margin
         for (x, y), s in zip(kpts, scores):
-            v = 1 if (args.mark_low_score_occluded and s < args.flag_score) else 2
-            flat += [round(float(x), 2), round(float(y), 2), v]
-            n_labelled += 1
+            x, y = float(x), float(y)
+            outside = not (-m <= x <= w - 1 + m and -m <= y <= h - 1 + m)
+            if outside:
+                n_oob += 1
+            if outside and args.oob == 'clip':
+                x = min(max(x, 0.0), w - 1.0)
+                y = min(max(y, 0.0), h - 1.0)
+            if outside and args.oob == 'drop':
+                # v=0 = "not labelled". Coordinates are still written (that is
+                # what CVAT itself does for absent points) so the annotator can
+                # re-enable one if the model was merely a few pixels off.
+                v = 0
+            elif args.mark_low_score_occluded and s < args.flag_score:
+                v = 1
+            else:
+                v = 2
+            flat += [round(x, 2), round(y, 2), v]
+        # count only genuinely labelled points -- v=0 must not inflate this
+        n_labelled = sum(1 for j in range(2, len(flat), 3) if flat[j] > 0)
 
         images.append(dict(
             id=i, width=int(w), height=int(h), file_name=cp.name,
@@ -174,6 +201,7 @@ def main():
             min_score=round(float(np.min(scores)), 4),
             mean_score=round(float(np.mean(scores)), 4),
             n_below_thr=int(np.sum(np.asarray(scores) < args.flag_score)),
+            n_out_of_bounds=n_oob,
             perp_violation_deg=round(perp, 2),
             parallel_violation_deg=round(par, 2),
             geom_violation_deg=round(max(perp, par), 2)))
@@ -206,19 +234,24 @@ def main():
 
     # Triage list: geometry violations first (they catch the confident-but-wrong
     # corner swaps), then low confidence.
-    review.sort(key=lambda r: (-r['geom_violation_deg'], r['min_score']))
+    review.sort(key=lambda r: (-r['n_out_of_bounds'],
+                               -r['geom_violation_deg'], r['min_score']))
     csv_path = out.with_name(out.stem + '_review.csv')
     with open(csv_path, 'w', newline='') as f:
         wr = csv.DictWriter(f, fieldnames=list(review[0].keys()))
         wr.writeheader()
         wr.writerows(review)
 
+    n_oob_imgs = sum(1 for r in review if r['n_out_of_bounds'] > 0)
+    tot_oob = sum(r['n_out_of_bounds'] for r in review)
     n_geom = sum(1 for r in review if r['geom_violation_deg'] > 0)
     n_score = sum(1 for r in review if r['n_below_thr'] > 0)
     print(f'\nWrote {len(images)} images / {len(annotations)} annotations')
     print(f'  COCO json : {out}')
     print(f'  review csv: {csv_path}')
     print(f'\nTriage:')
+    print(f'  {tot_oob} keypoints across {n_oob_imgs}/{len(review)} images fell '
+          f'outside the image ({args.oob})')
     print(f'  {n_geom}/{len(review)} images violate the box geometry priors '
           f'(>{args.tolerance_deg:g} deg) -- review these FIRST')
     print(f'  {n_score}/{len(review)} images have >=1 keypoint below '
