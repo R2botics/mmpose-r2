@@ -47,6 +47,12 @@ dependencies:
       # 2.x in and clobbers the pin above. 4.11 is the newest 4.x that
       # resolves against numpy 1.26.
       - opencv-python<5
+      # HAZARD: opencv-python-headless is a *different* package providing the
+      # same cv2 module, and its 5.x/4.14+ releases also require numpy>=2.
+      # It arrives transitively (e.g. fiftyone / voxel51-eta depend on it) and
+      # will silently drag numpy 2.x back in, breaking mmcv and xtcocotools
+      # with "numpy.dtype size changed". If anything installs it, pin it too:
+      #     pip install "numpy<2" "opencv-python<5" "opencv-python-headless<5"
       - pillow
       - scipy
       # COCO keypoint eval — backs `val_evaluator = dict(type='CocoMetric')`

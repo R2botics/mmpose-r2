@@ -1,0 +1,146 @@
+"""STAGE 3: adapt the finetuned RGBD model to the Chewy customer rig.
+
+Continues from the stage-2 checkpoint rather than restarting from the
+synthetic pretrain — the model already solves the task; this stage only has to
+absorb a new rig (camera serials CPB39530000S / CPB39530003D) from 70
+newly-labelled images.
+
+DATASET LAYOUT
+    Each collected set stays in its own self-contained folder:
+
+        <anywhere>/rsc_rgbd/{images,depth,annotations}
+        <anywhere>/ChewyCrops2/{images,depth,annotations}
+        <anywhere>/<future_set>/{images,depth,annotations}
+
+    and `CombinedDataset` unions them at config level. No symlinks, no merged
+    annotation file, no rewriting of file_name or ids — each set keeps its
+    original annotations untouched, which matters for customer data you may
+    have to hand back or re-export.
+
+    Adding a future set = one more entry in `datasets` below.
+
+    `sample_ratio_factor` re-weights the sets. 70 Chewy images against 288 RSC
+    is only 20% of the batch; the 3.0 below oversamples Chewy to ~210 so the
+    new rig is roughly 42% of what the model sees. Lower it toward 1.0 if the
+    model starts forgetting the original rig (watch coco/AP on val).
+
+    NOTE sub-datasets carry `pipeline=[]` — CombinedDataset owns the shared
+    pipeline and applies it after the sub-dataset returns raw data_info.
+
+Purpose is a *pre-labelling* model: good enough that correcting the remaining
+316 images in CVAT is fast. Not a deployment candidate — for that, gate on the
+OOD set, not on val (see the RGB-vs-RGBD result where val ranked them backwards).
+
+Note on the new data: 34 of the 70 images are only partially labelled — the
+SOUTH flap is often not visible from this rig, so EAST_2/SOUTH_1/SOUTH_2/WEST_1
+are frequently v=0. Those points are excluded from the loss via
+keypoint_weights, so partial labels cost supervision but do no harm.
+"""
+_base_ = ['./hrnet-w32_8-kp_udp_rgbd_geom.py']
+
+custom_imports = dict(
+    imports=[
+        'mmpose.datasets.transforms.rgbd',
+        'mmpose.models.data_preprocessors.nchannel',
+        'mmpose.models.losses.geometric_loss',
+        'mmpose.engine.vis_backends.safe_mlflow',
+    ],
+    allow_failed_imports=False)
+
+vis_backends = [
+    dict(type='LocalVisBackend'),
+    dict(type='TensorboardVisBackend'),
+    dict(
+        type='SafeMLflowVisBackend',
+        exp_name='box-flap-pose',
+        run_name='rgbd-geom-finetune-chewy2',
+        tracking_uri='http://10.200.104.2:31016',
+        tags=dict(
+            model='hrnet-w32',
+            variant='rgbd-geom',
+            data='real+chewy2',
+            train_size='288+70(x3)',
+            stage='finetune-chewy2',
+            backbone_init='stage2-finetuned'),
+        artifact_suffix=['.py', '.pth', '.json']),
+]
+visualizer = dict(
+    type='PoseLocalVisualizer', vis_backends=vis_backends, name='visualizer')
+
+# Start from the best stage-2 model. UPDATE if you use test_01 (AP 0.9446)
+# rather than test_02 (AP 0.9433).
+load_from = 'work_dirs/hrnet_synth_then_real_test_02/best_coco_AP_epoch_100.pth'
+resume = False
+
+# ---------------------------------------------------------------- datasets
+metainfo_file = 'configs/_base_/datasets/RSC_Keypoints.py'
+
+# Point these at wherever each set lives on the training box.
+rsc_root = 'data/RSC_Keypoints_RGBD'
+chewy_root = 'data/ChewyCrops2'
+
+train_pipeline = [
+    dict(type='LoadRGBDImage'),
+    dict(type='GetBBoxCenterScale'),
+    dict(type='RandomBBoxTransform',
+         shift_factor=0.1, scale_factor=[0.75, 1.25], rotate_factor=30),
+    dict(type='TopdownAffine', input_size=(256, 256), use_udp=True),
+    dict(type='PhotometricDistortionRGBOnly',
+         brightness_delta=32, contrast_range=(0.6, 1.4),
+         saturation_range=(0.6, 1.4), hue_delta=18),
+    dict(type='GenerateTarget', encoder={{_base_.codec}}),
+    dict(type='PackPoseInputs'),
+]
+
+
+def _subset(root, ann):
+    return dict(
+        type='CocoDataset',
+        data_root=root,
+        ann_file=ann,
+        data_prefix=dict(img='images/'),
+        metainfo=dict(from_file=metainfo_file),
+        pipeline=[])          # CombinedDataset owns the pipeline
+
+
+train_dataloader = dict(
+    batch_size=16,
+    num_workers=4,
+    dataset=dict(
+        _delete_=True,
+        type='CombinedDataset',
+        metainfo=dict(from_file=metainfo_file),
+        datasets=[
+            _subset(rsc_root, 'annotations/person_keypoints_train.json'),
+            _subset(chewy_root, 'annotations/person_keypoints_Train.json'),
+        ],
+        # [RSC, Chewy] -- oversample the 70 new images 3x
+        sample_ratio_factor=[1.0, 3.0],
+        pipeline=train_pipeline))
+
+# Validation stays on the ORIGINAL real val split, and a plain CocoDataset,
+# because CocoMetric needs a single ann_file. It does NOT measure Chewy
+# performance — nothing does, since all 70 labelled Chewy images are in train.
+# Its job is to catch forgetting: if coco/AP falls well below the ~0.94
+# stage-2 plateau, this stage is damaging the model rather than extending it.
+
+# ---------------------------------------------------------------- schedule
+# Half of stage 2's 1e-4. With only 70 new images the risk is overfitting them
+# and forgetting the original rig, not underfitting.
+optim_wrapper = dict(
+    optimizer=dict(lr=5e-5),
+    paramwise_cfg=dict(
+        bypass_duplicate=True,
+        custom_keys=dict(backbone=dict(lr_mult=0.5))))
+
+# 498 effective samples / batch 16 = 31 iters per epoch.
+train_cfg = dict(by_epoch=True, max_epochs=60, val_interval=5)
+
+# Heatmaps arrive already converged, so the geometric prior can engage early.
+model = dict(head=dict(loss=dict(warmup_steps=200)))
+
+param_scheduler = [
+    dict(type='LinearLR', start_factor=1.0e-5, by_epoch=False,
+         begin=0, end=50),
+    dict(type='CosineAnnealingLR', eta_min=0, begin=0, end=60, by_epoch=True),
+]
