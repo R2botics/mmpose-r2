@@ -1,9 +1,21 @@
-"""STAGE 3: adapt the finetuned RGBD model to the Chewy customer rig.
+"""STAGE 2 (re-run): finetune the synthetic-pretrained RGBD model on ALL real
+data — the original RSC set plus the new Chewy customer rig.
 
-Continues from the stage-2 checkpoint rather than restarting from the
-synthetic pretrain — the model already solves the task; this stage only has to
-absorb a new rig (camera serials CPB39530000S / CPB39530003D) from 70
-newly-labelled images.
+This deliberately restarts from the **synthetic pretrain**, not from the
+stage-2 finetuned checkpoint. Chaining finetune-on-finetune would work, but:
+
+  * It is the SAME recipe already validated twice (0.9446 / 0.9433), just with
+    more real data. Continuing from a finetuned model would be a new,
+    unvalidated 3-stage schedule.
+  * The model learns both rigs JOINTLY instead of learning rig A and then being
+    nudged toward rig B, which is what invites catastrophic forgetting.
+  * It scales. This loop repeats every time a customer set is labelled; a
+    chain of finetunes accumulates path dependence and becomes impossible to
+    reproduce, whereas "synth-pretrain -> finetune on all real data" is a
+    fixed, repeatable procedure no matter how many sets exist.
+
+Because it restarts from the pretrain, the schedule matches stage 2 (lr 1e-4,
+150 epochs) rather than the short low-LR schedule a continuation would use.
 
 DATASET LAYOUT
     Each collected set stays in its own self-contained folder:
@@ -59,17 +71,19 @@ vis_backends = [
             model='hrnet-w32',
             variant='rgbd-geom',
             data='real+chewy2',
-            train_size='288+70(x3)',
-            stage='finetune-chewy2',
-            backbone_init='stage2-finetuned'),
+            train_size='288+70(x2)',
+            stage='finetune-real+chewy2',
+            backbone_init='synthetic-pretrained'),
         artifact_suffix=['.py', '.pth', '.json']),
 ]
 visualizer = dict(
     type='PoseLocalVisualizer', vis_backends=vis_backends, name='visualizer')
 
-# Start from the best stage-2 model. UPDATE if you use test_01 (AP 0.9446)
-# rather than test_02 (AP 0.9433).
-load_from = 'work_dirs/hrnet_synth_then_real_test_02/best_coco_AP_epoch_100.pth'
+# The SYNTHETIC-pretrained backbone — the same starting point stage 2 used.
+# This is what hrnet-w32_8-kp_udp_rgbd_geom_finetune_real.py loads.
+# (run 270a8336, the best stage 2 at AP 0.9446, instead started from
+#  work_dirs/hrnet_synth_pretrain_test_01/best_coco_AP_epoch_20.pth)
+load_from = 'work_dirs/hrnet_synth_pretrain_test_02/best_coco_AP_epoch_70.pth'
 resume = False
 
 # ---------------------------------------------------------------- datasets
@@ -114,33 +128,39 @@ train_dataloader = dict(
             _subset(rsc_root, 'annotations/person_keypoints_train.json'),
             _subset(chewy_root, 'annotations/person_keypoints_Train.json'),
         ],
-        # [RSC, Chewy] -- oversample the 70 new images 3x
-        sample_ratio_factor=[1.0, 3.0],
+        # [RSC, Chewy] -- oversample the 70 new images 2x -> ~33% of the batch.
+        # Lower than it would be for a short continuation run: over 150 epochs
+        # a 3x factor shows each Chewy image ~450 times, which overfits 70
+        # images. Raise it if the Chewy pre-labels come out weak, lower it
+        # toward 1.0 if val AP sags.
+        sample_ratio_factor=[1.0, 2.0],
         pipeline=train_pipeline))
 
 # Validation stays on the ORIGINAL real val split, and a plain CocoDataset,
 # because CocoMetric needs a single ann_file. It does NOT measure Chewy
 # performance — nothing does, since all 70 labelled Chewy images are in train.
 # Its job is to catch forgetting: if coco/AP falls well below the ~0.94
-# stage-2 plateau, this stage is damaging the model rather than extending it.
+# stage-2 plateau (~0.94), something is wrong. It should land in the same
+# range as stage 2, since this IS stage 2 with extra data.
 
 # ---------------------------------------------------------------- schedule
-# Half of stage 2's 1e-4. With only 70 new images the risk is overfitting them
-# and forgetting the original rig, not underfitting.
+# Stage 2's schedule verbatim — starting from the synthetic pretrain, the model
+# has to actually learn the real domain, not just nudge toward a new rig.
 optim_wrapper = dict(
-    optimizer=dict(lr=5e-5),
+    optimizer=dict(lr=1e-4),
     paramwise_cfg=dict(
         bypass_duplicate=True,
         custom_keys=dict(backbone=dict(lr_mult=0.5))))
 
-# 498 effective samples / batch 16 = 31 iters per epoch.
-train_cfg = dict(by_epoch=True, max_epochs=60, val_interval=5)
+# 288 + 140 = 428 effective samples / batch 16 = 27 iters per epoch.
+train_cfg = dict(by_epoch=True, max_epochs=150, val_interval=10)
 
-# Heatmaps arrive already converged, so the geometric prior can engage early.
+# Same as stage 2: heatmaps from the synthetic pretrain are already well-formed,
+# so the geometric prior can engage quickly. 200 steps ~ 7 epochs here.
 model = dict(head=dict(loss=dict(warmup_steps=200)))
 
 param_scheduler = [
     dict(type='LinearLR', start_factor=1.0e-5, by_epoch=False,
          begin=0, end=50),
-    dict(type='CosineAnnealingLR', eta_min=0, begin=0, end=60, by_epoch=True),
+    dict(type='CosineAnnealingLR', eta_min=0, begin=0, end=150, by_epoch=True),
 ]
