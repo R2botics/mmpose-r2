@@ -242,7 +242,16 @@ default_hooks = dict(
     checkpoint=dict(
         type='CheckpointHook',
         interval=10,
-        save_best=['max/mean_px', 'rsc/mean_px', 'chewy/mean_px'],
+        # Selection is on the ROTATION-TOLERANT error. Downstream associates
+        # the four spans across the two camera views, so a cyclically clocked
+        # flap assignment (NORTH read as EAST etc, common on rotated boxes)
+        # costs nothing in the product -- but it moves every corner about one
+        # box-side, which makes plain mean_px enormous for a prediction whose
+        # geometry is correct. Selecting on mean_px would chase a labelling
+        # convention instead of accuracy.
+        # `best_max_cyclic_mean_px_epoch_N.pth` is the one to ship.
+        save_best=['max/cyclic_mean_px',
+                   'rsc/cyclic_mean_px', 'chewy/cyclic_mean_px'],
         rule='less'))
 
 # ---------------------------------------------------------------- test

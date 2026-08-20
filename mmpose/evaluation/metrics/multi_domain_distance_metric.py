@@ -77,6 +77,20 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
         report_worst (int): Log this many worst-offending keypoints per domain
             after each evaluation, with image path and keypoint name. 0
             disables. Defaults to 5.
+        report_cyclic (bool): Also score each instance under the four cyclic
+            re-assignments of the flaps (NORTH->EAST->SOUTH->WEST->NORTH) and
+            report the best. On a rotated box the cardinal labels can be one
+            flap out, which makes every corner land on its neighbour's position
+            -- roughly one box side away. That inflates the error by ~100px per
+            corner while the predicted GEOMETRY is actually correct. Comparing
+            `mean_px` with `cyclic_mean_px` separates "wrong shape" from
+            "right shape, rotated labels".
+
+            This project's downstream associates the four spans across two
+            camera views, so a rotated/clocked assignment is harmless there --
+            which makes `cyclic_mean_px` the error that actually matters and
+            `max/cyclic_mean_px` the right thing to select on. Both are always
+            emitted; pick via `save_best`. Defaults to True.
     """
 
     default_prefix: Optional[str] = None
@@ -85,6 +99,7 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
                  domains: Sequence[dict],
                  fail_thr_px: float = 20.0,
                  report_worst: int = 5,
+                 report_cyclic: bool = True,
                  collect_device: str = 'cpu',
                  prefix: Optional[str] = None) -> None:
         super().__init__(collect_device=collect_device, prefix=prefix)
@@ -101,6 +116,7 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
             raise ValueError(f'duplicate domain names: {self.domain_names}')
         self.fail_thr_px = float(fail_thr_px)
         self.report_worst = int(report_worst)
+        self.report_cyclic = bool(report_cyclic)
         self._roots = sorted(
             ((osp.normpath(d['data_root']), i) for i, d in enumerate(domains)),
             key=lambda t: -len(t[0]))
@@ -132,22 +148,39 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
                 m = np.asarray(vis[i]) > 0
                 if not m.any():
                     continue
-                d = np.linalg.norm(
-                    np.asarray(pred[i])[m][:, :2] - np.asarray(gt[i])[m][:, :2],
-                    axis=-1)
+                pk = np.asarray(pred[i])[:, :2]
+                gk = np.asarray(gt[i])[:, :2]
+                d = np.linalg.norm(pk[m] - gk[m], axis=-1)
                 # keep which keypoint each distance came from, so the worst
                 # offenders can be named rather than just counted
                 kpt_idx = np.flatnonzero(m)
+
+                # best of the four cyclic flap assignments. Each flap owns two
+                # consecutive keypoints, so one flap of rotation is a shift of
+                # two indices.
+                best_d, best_shift = d, 0
+                if self.report_cyclic and pk.shape[0] == 8:
+                    for shift in (2, 4, 6):
+                        rolled = np.roll(pk, shift, axis=0)
+                        cand = np.linalg.norm(rolled[m] - gk[m], axis=-1)
+                        if cand.mean() < best_d.mean():
+                            best_d, best_shift = cand, shift
+
                 self.results.append((idx, d.astype(np.float64), kpt_idx,
-                                     data_sample['img_path']))
+                                     data_sample['img_path'],
+                                     best_d.astype(np.float64), best_shift))
 
     def compute_metrics(self, results: list) -> Dict[str, float]:
         logger: MMLogger = MMLogger.get_current_instance()
 
         grouped = defaultdict(list)
         offenders = defaultdict(list)   # (error, img_path, keypoint index)
-        for idx, d, kpt_idx, img_path in results:
+        cyc = defaultdict(list)
+        shifts = defaultdict(list)
+        for idx, d, kpt_idx, img_path, best_d, best_shift in results:
             grouped[idx].append(d)
+            cyc[idx].append(best_d)
+            shifts[idx].append(best_shift)
             if self.report_worst:
                 for e, ki in zip(d, kpt_idx):
                     offenders[idx].append((float(e), img_path, int(ki)))
@@ -179,6 +212,22 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
             })
             per_domain_mean[name] = float(e.mean())
 
+            if self.report_cyclic and cyc[idx]:
+                ce = np.concatenate(cyc[idx])
+                sh = np.asarray(shifts[idx])
+                n_rot = int((sh != 0).sum())
+                metrics[f'{name}/cyclic_mean_px'] = float(ce.mean())
+                metrics[f'{name}/cyclic_n_over_{int(self.fail_thr_px)}px'] = \
+                    float((ce >= self.fail_thr_px).sum())
+                metrics[f'{name}/n_rotated_instances'] = float(n_rot)
+                logger.info(
+                    f'[MultiDomainKeypointDistanceMetric] {name} cyclic check: '
+                    f'{n_rot}/{len(sh)} instances score better under a rotated '
+                    f'flap assignment; mean {e.mean():.2f}px -> '
+                    f'{ce.mean():.2f}px, >{int(self.fail_thr_px)}px '
+                    f'{int((e >= self.fail_thr_px).sum())} -> '
+                    f'{int((ce >= self.fail_thr_px).sum())}')
+
             if self.report_worst and offenders[idx]:
                 top = sorted(offenders[idx], key=lambda t: -t[0])[:self.report_worst]
                 logger.info(f'[MultiDomainKeypointDistanceMetric] {name} '
@@ -193,6 +242,16 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
             worst = max(per_domain_mean, key=per_domain_mean.get)
             metrics['max/mean_px'] = per_domain_mean[worst]
             metrics['max/domain_index'] = float(self.domain_names.index(worst))
+
+            # same minimax, but on the rotation-tolerant error
+            cyc_means = {n: metrics[f'{n}/cyclic_mean_px']
+                         for n in per_domain_mean
+                         if f'{n}/cyclic_mean_px' in metrics}
+            if cyc_means:
+                cworst = max(cyc_means, key=cyc_means.get)
+                metrics['max/cyclic_mean_px'] = cyc_means[cworst]
+                metrics['max/cyclic_domain_index'] = float(
+                    self.domain_names.index(cworst))
             summary = '  '.join(
                 f'{n}={metrics[f"{n}/mean_px"]:.2f}px'
                 f'(med {metrics[f"{n}/median_px"]:.2f},'
