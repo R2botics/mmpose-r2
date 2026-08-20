@@ -33,6 +33,13 @@ Emits per domain:  <name>/mean_px, /median_px, /p90_px, /max_px,
                    /n_over_20px, /frac_over_20px, /n_keypoints
 plus:              max/mean_px, max/domain_index
 
+Set ``report_worst`` to log the identity (image + keypoint name) of the
+largest errors each evaluation. A max error that is IDENTICAL across many
+epochs is the signature of a mislabelled ground-truth point rather than a
+model failure -- the prediction tracks the real corner while the annotation
+stays put, so the gap does not move as the weights do. Naming the file and
+corner turns that from a number into something you can go and look at.
+
 Usage:
     val_evaluator = [
         dict(type='MultiDomainKeypointDistanceMetric',
@@ -67,6 +74,9 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
             like data/ChewyCrops and data/ChewyCrops2 disambiguate correctly.
         fail_thr_px (float): Errors at or above this count as unusable
             corners. Defaults to 20.0.
+        report_worst (int): Log this many worst-offending keypoints per domain
+            after each evaluation, with image path and keypoint name. 0
+            disables. Defaults to 5.
     """
 
     default_prefix: Optional[str] = None
@@ -74,6 +84,7 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
     def __init__(self,
                  domains: Sequence[dict],
                  fail_thr_px: float = 20.0,
+                 report_worst: int = 5,
                  collect_device: str = 'cpu',
                  prefix: Optional[str] = None) -> None:
         super().__init__(collect_device=collect_device, prefix=prefix)
@@ -89,6 +100,7 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
         if len(set(self.domain_names)) != len(self.domain_names):
             raise ValueError(f'duplicate domain names: {self.domain_names}')
         self.fail_thr_px = float(fail_thr_px)
+        self.report_worst = int(report_worst)
         self._roots = sorted(
             ((osp.normpath(d['data_root']), i) for i, d in enumerate(domains)),
             key=lambda t: -len(t[0]))
@@ -123,14 +135,26 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
                 d = np.linalg.norm(
                     np.asarray(pred[i])[m][:, :2] - np.asarray(gt[i])[m][:, :2],
                     axis=-1)
-                self.results.append((idx, d.astype(np.float64)))
+                # keep which keypoint each distance came from, so the worst
+                # offenders can be named rather than just counted
+                kpt_idx = np.flatnonzero(m)
+                self.results.append((idx, d.astype(np.float64), kpt_idx,
+                                     data_sample['img_path']))
 
     def compute_metrics(self, results: list) -> Dict[str, float]:
         logger: MMLogger = MMLogger.get_current_instance()
 
         grouped = defaultdict(list)
-        for idx, d in results:
+        offenders = defaultdict(list)   # (error, img_path, keypoint index)
+        for idx, d, kpt_idx, img_path in results:
             grouped[idx].append(d)
+            if self.report_worst:
+                for e, ki in zip(d, kpt_idx):
+                    offenders[idx].append((float(e), img_path, int(ki)))
+
+        kpt_names = None
+        if self.dataset_meta:
+            kpt_names = self.dataset_meta.get('keypoint_id2name')
 
         metrics: Dict[str, float] = {}
         per_domain_mean: Dict[str, float] = {}
@@ -154,6 +178,16 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
                 f'{name}/n_keypoints': float(e.size),
             })
             per_domain_mean[name] = float(e.mean())
+
+            if self.report_worst and offenders[idx]:
+                top = sorted(offenders[idx], key=lambda t: -t[0])[:self.report_worst]
+                logger.info(f'[MultiDomainKeypointDistanceMetric] {name} '
+                            f'worst {len(top)} keypoints:')
+                for err, img_path, ki in top:
+                    kn = (kpt_names.get(ki, f'kpt_{ki}')
+                          if isinstance(kpt_names, dict) else f'kpt_{ki}')
+                    logger.info(f'    {err:8.1f}px  {kn:<9s} '
+                                f'{osp.basename(img_path)}')
 
         if per_domain_mean:
             worst = max(per_domain_mean, key=per_domain_mean.get)
