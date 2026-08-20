@@ -220,6 +220,30 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
                 metrics[f'{name}/cyclic_n_over_{int(self.fail_thr_px)}px'] = \
                     float((ce >= self.fail_thr_px).sum())
                 metrics[f'{name}/n_rotated_instances'] = float(n_rot)
+                # Split by KIND of rotation. This project assigns NORTH/SOUTH
+                # to the two SHORT (minor) flaps and EAST/WEST to the two LONG
+                # (major wall) flaps, which is rotation-invariant. So:
+                #   shift 4 (180 deg) -- swaps N<->S and E<->W. Short stays
+                #     short: the convention is respected and only the
+                #     which-end-is-north tie-break differs. Benign.
+                #   shift 2 or 6 (90 deg) -- swaps a short flap for a long
+                #     one. On a clearly rectangular box that means the aspect
+                #     orientation was misread; on a SQUARE box it is genuinely
+                #     undecidable and the model's guess is as good as any.
+                #     Either way this project's downstream associates the four
+                #     spans across the two camera views, so it is absorbed --
+                #     which is why selection uses max/cyclic_mean_px (best of
+                #     all four assignments) rather than the raw error.
+                #     Treat a rising n_clock90 on rectangular boxes as a signal
+                #     worth looking at, not as a failure to fix.
+                metrics[f'{name}/n_flip180'] = float((sh == 4).sum())
+                metrics[f'{name}/n_clock90'] = float(((sh == 2) | (sh == 6)).sum())
+                logger.info(
+                    f'[MultiDomainKeypointDistanceMetric] {name} rotation kinds: '
+                    f'{int((sh == 4).sum())} x 180deg flip (benign, short flaps '
+                    f'stay short), '
+                    f'{int(((sh == 2) | (sh == 6)).sum())} x 90deg clock '
+                    f'(major/minor swapped -- violates the N/S=short convention)')
                 logger.info(
                     f'[MultiDomainKeypointDistanceMetric] {name} cyclic check: '
                     f'{n_rot}/{len(sh)} instances score better under a rotated '
