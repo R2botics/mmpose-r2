@@ -74,6 +74,10 @@ def main():
                     help='rewrite out-of-bounds v=1/v=2 to v=0 and recompute '
                          'num_keypoints')
     ap.add_argument('--no-backup', action='store_true')
+    ap.add_argument('--fix-convention', action='store_true',
+                    help='Roll the keypoints of convention-violating (90deg '
+                         'clocked) annotations by two slots so the SHORT flaps '
+                         'become NORTH/SOUTH. Implies --check-convention.')
     ap.add_argument('--check-convention', action='store_true',
                     help='Also report annotations that violate the flap '
                          'convention (NORTH/SOUTH = the two SHORT minor flaps, '
@@ -121,7 +125,7 @@ def main():
         byname = collections.Counter(r['name'] for r in oob)
         print(f'\n  by keypoint: {dict(byname.most_common())}')
 
-        if args.check_convention:
+        if args.check_convention or args.fix_convention:
             imgs = {i['id']: i for i in data['images']}
             PAIRS = {'NORTH': (0, 1), 'EAST': (2, 3), 'SOUTH': (4, 5), 'WEST': (6, 7)}
             viol, near, ok = [], 0, 0
@@ -140,7 +144,7 @@ def main():
                 ns = (span['NORTH'] + span['SOUTH']) / 2
                 ew = (span['EAST'] + span['WEST']) / 2
                 if ns >= ew:
-                    viol.append((ns / ew, im['file_name'], span))
+                    viol.append((ns / ew, im['file_name'], span, ann))
                 elif abs(ns / ew - 1) < 0.10:
                     near += 1
                 else:
@@ -152,12 +156,31 @@ def main():
             print(f'    near-square (ambiguous, within 10%): {near}')
             print(f'    VIOLATIONS (90deg clocked): {len(viol)}'
                   f'  = {100*len(viol)/max(total,1):.1f}%')
-            for r, fn, sp in sorted(viol, key=lambda t: -t[0])[:10]:
+            for r, fn, sp, _a in sorted(viol, key=lambda t: -t[0])[:10]:
                 print(f'      ratio {r:.2f}  N={sp["NORTH"]:.0f} S={sp["SOUTH"]:.0f} | '
                       f'E={sp["EAST"]:.0f} W={sp["WEST"]:.0f}   {fn[:52]}')
             if viol:
                 print('    -> these carry FULL gradient in training, unlike '
                       'out-of-bounds points (weight 0).')
+
+            if args.fix_convention and viol:
+                if not args.no_backup:
+                    bak = path.with_suffix(path.suffix + '.bak')
+                    if not bak.exists():
+                        shutil.copy(path, bak)
+                        print(f'    backup written: {bak}')
+                    else:
+                        print(f'    backup kept (already exists): {bak}')
+                for _r, fn, _sp, ann in viol:
+                    kp = ann['keypoints']
+                    trip = [kp[i:i + 3] for i in range(0, len(kp), 3)]
+                    # roll right by 2 slots: new NORTH = old WEST, so the SHORT
+                    # pair lands on NORTH/SOUTH as the convention requires
+                    rolled = trip[-2:] + trip[:-2]
+                    ann['keypoints'] = [v for t in rolled for v in t]
+                path.write_text(json.dumps(data))
+                print(f'    FIXED CONVENTION: rolled {len(viol)} annotations '
+                      f'by two flaps -> {path}')
 
         if args.fix:
             if not args.no_backup:
