@@ -240,6 +240,56 @@ default_hooks = dict(
         save_best=['max/mean_px', 'rsc/mean_px', 'chewy/mean_px'],
         rule='less'))
 
+# ---------------------------------------------------------------- test
+# Mirrors val exactly, so `tools/test.py <config> <ckpt>` evaluates a chosen
+# checkpoint on BOTH domains in one pass — including the worst-offender report
+# that names the file and keypoint behind each large error.
+#
+# `_delete_` is needed on these two because the base sets them to None and a
+# dict-valued child is merged; it must NOT appear inside `test_evaluator`,
+# which is a list whose elements are constructed rather than merged.
+test_cfg = dict(_delete_=True)
+
+test_dataloader = dict(
+    _delete_=True,
+    batch_size=16,
+    num_workers=4,
+    persistent_workers=True,
+    drop_last=False,
+    sampler=dict(type='DefaultSampler', shuffle=False, round_up=False),
+    dataset=dict(
+        type='CombinedDataset',
+        metainfo=dict(from_file=metainfo_file),
+        datasets=[
+            dict(type='CocoDataset', data_root=rsc_root,
+                 ann_file='annotations/person_keypoints_val.json',
+                 data_prefix=dict(img='images/'),
+                 metainfo=dict(from_file=metainfo_file),
+                 test_mode=True, pipeline=[]),
+            dict(type='CocoDataset', data_root=chewy_val_root,
+                 ann_file='annotations/person_keypoints_Train.json',
+                 data_prefix=dict(img='images/'),
+                 metainfo=dict(from_file=metainfo_file),
+                 test_mode=True, pipeline=[]),
+        ],
+        pipeline=val_pipeline))
+
+test_evaluator = [
+    dict(type='MultiDomainKeypointDistanceMetric',
+         domains=[dict(name='rsc', data_root=rsc_root),
+                  dict(name='chewy', data_root=chewy_val_root)],
+         fail_thr_px=20.0,
+         # more offenders than during training: this is the audit pass
+         report_worst=15),
+    dict(type='MultiDomainCocoMetric',
+         domains=[
+             dict(name='rsc', data_root=rsc_root,
+                  ann_file=f'{rsc_root}/annotations/person_keypoints_val.json'),
+             dict(name='chewy', data_root=chewy_val_root,
+                  ann_file=f'{chewy_val_root}/annotations/person_keypoints_Train.json'),
+         ]),
+]
+
 # ---------------------------------------------------------------- schedule
 # Stage 2's schedule verbatim — starting from the synthetic pretrain, the model
 # has to actually learn the real domain, not just nudge toward a new rig.
