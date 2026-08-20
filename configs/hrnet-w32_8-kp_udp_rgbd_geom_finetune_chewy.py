@@ -203,7 +203,10 @@ val_dataloader = dict(
 # the two annotation files both number from 1 and would otherwise collide.
 val_evaluator = [
     dict(
-        _delete_=True,
+        # NOTE: no _delete_ here. It is consumed by mmengine's *dict* merge;
+        # inside a list element it survives and reaches the constructor as an
+        # unexpected kwarg. Assigning a list to val_evaluator already replaces
+        # the base's dict wholesale, so no _delete_ is needed.
         type='MultiDomainKeypointDistanceMetric',
         domains=[
             dict(name='rsc', data_root=rsc_root),
