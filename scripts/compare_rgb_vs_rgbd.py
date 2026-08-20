@@ -293,6 +293,15 @@ def main():
                              'diagonal (default 0.05)')
     parser.add_argument('--no-gt-overlay', action='store_true',
                         help='Do not draw ground truth on the output panels')
+    parser.add_argument('--worst', type=int, default=0,
+                        help='Keep only the N worst images (by max per-keypoint '
+                             'error) and delete the rest. Requires --ann-file. '
+                             'Use this to audit failures instead of scrolling '
+                             'hundreds of panels. 0 = keep everything.')
+    parser.add_argument('--worst-by', choices=['max', 'mean'], default='max',
+                        help="Rank images by their worst single keypoint "
+                             "('max', default) or by mean error over labelled "
+                             "keypoints ('mean').")
     parser.add_argument('--model', nargs=3, action='append', required=True,
                         metavar=('CONFIG', 'CHECKPOINT', 'LABEL'),
                         help='Add a model to compare. Repeat this flag '
@@ -335,6 +344,7 @@ def main():
         })
 
     csv_rows = []
+    ranking = []
 
     # Decide input list
     if args.image:
@@ -391,6 +401,14 @@ def main():
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                                 (255, 255, 255), 1, cv2.LINE_AA)
 
+            if gt_kpts is not None:
+                # Rank this image for --worst. With several --model triples the
+                # last one wins; for an audit you normally pass a single model.
+                with np.errstate(invalid='ignore'):
+                    mx, mn = float(np.nanmax(dists)), float(np.nanmean(dists))
+                if not np.isnan(mx):
+                    ranking.append((mx, mn, color_path.name))
+
             panels.append((m['label'], m['folder'], viz))
             cv2.imwrite(str(out_root / m['folder'] / color_path.name), viz)
 
@@ -417,6 +435,28 @@ def main():
         sbs = np.concatenate([header, sbs], axis=0)
 
         cv2.imwrite(str(out_root / 'side_by_side' / color_path.name), sbs)
+
+    # -- Keep only the worst N ----------------------------------------------
+    if args.worst and ranking:
+        key = 0 if args.worst_by == 'max' else 1
+        ranking.sort(key=lambda t: -t[key])
+        keep = {name for *_, name in ranking[:args.worst]}
+        removed = 0
+        for sub in [m['folder'] for m in models] + ['depth', 'side_by_side']:
+            d = out_root / sub
+            if not d.is_dir():
+                continue
+            for f in d.glob('*.png'):
+                if f.name not in keep:
+                    f.unlink(); removed += 1
+        print(f'\n--worst {args.worst}: kept {len(keep)} images '
+              f'(ranked by {args.worst_by} per-keypoint error), '
+              f'deleted {removed} panel files')
+        print(f'  {"rank":>4}{"max_px":>10}{"mean_px":>10}  image')
+        for n, (mx, mn, name) in enumerate(ranking[:args.worst], 1):
+            print(f'  {n:>4}{mx:>10.1f}{mn:>10.1f}  {name}')
+    elif args.worst and not ranking:
+        print('\n--worst ignored: needs --ann-file to rank by error')
 
     # -- Scoring summary ----------------------------------------------------
     if csv_rows:
