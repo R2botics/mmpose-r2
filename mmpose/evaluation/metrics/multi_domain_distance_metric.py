@@ -29,6 +29,17 @@ Unlabelled ground-truth keypoints (visibility 0) are excluded, not scored as
 zero error. That matters here: on this data the SOUTH flap is often not
 visible, so a large fraction of val keypoints are v=0.
 
+Out-of-image ground truth is excluded too (`ignore_out_of_bounds`). The RSC
+annotations mark corners that fall outside the crop as **v=1**, and mmpose maps
+both v=1 and v=2 to "visible" (base_coco_style_dataset.py:296,
+`np.minimum(1, v)`), so they would otherwise be scored. They cannot be: a
+prediction is confined to the heatmap's extent, while these targets sit up to
+~210 px outside the image. Worse, `UDPHeatmap.encode` sets their
+`keypoint_weight` to 0, so the model is never TRAINED on them -- scoring them
+judges the model on corners it was explicitly taught to ignore. Left in, they
+pin `max_px` to a constant and freeze the failure count regardless of how well
+training goes.
+
 Emits per domain:  <name>/mean_px, /median_px, /p90_px, /max_px,
                    /n_over_20px, /frac_over_20px, /n_keypoints
 plus:              max/mean_px, max/domain_index
@@ -74,6 +85,11 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
             like data/ChewyCrops and data/ChewyCrops2 disambiguate correctly.
         fail_thr_px (float): Errors at or above this count as unusable
             corners. Defaults to 20.0.
+        ignore_out_of_bounds (bool): Skip ground-truth keypoints lying outside
+            the image, matching what training already does. Defaults to True.
+        oob_margin_px (float): Slack before a GT keypoint counts as out of
+            bounds. Defaults to 0.0. Mild overshoots still train (the Gaussian
+            is partly visible), so a small positive margin keeps those scored.
         report_worst (int): Log this many worst-offending keypoints per domain
             after each evaluation, with image path and keypoint name. 0
             disables. Defaults to 5.
@@ -98,6 +114,8 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
     def __init__(self,
                  domains: Sequence[dict],
                  fail_thr_px: float = 20.0,
+                 ignore_out_of_bounds: bool = True,
+                 oob_margin_px: float = 0.0,
                  report_worst: int = 5,
                  report_cyclic: bool = True,
                  collect_device: str = 'cpu',
@@ -115,6 +133,8 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
         if len(set(self.domain_names)) != len(self.domain_names):
             raise ValueError(f'duplicate domain names: {self.domain_names}')
         self.fail_thr_px = float(fail_thr_px)
+        self.ignore_out_of_bounds = bool(ignore_out_of_bounds)
+        self.oob_margin_px = float(oob_margin_px)
         self.report_worst = int(report_worst)
         self.report_cyclic = bool(report_cyclic)
         self._roots = sorted(
@@ -132,6 +152,7 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
 
     def process(self, data_batch: Sequence[dict],
                 data_samples: Sequence[dict]) -> None:
+        n_dropped = 0
         for data_sample in data_samples:
             idx = self._route(data_sample['img_path'])
             pred = data_sample['pred_instances']['keypoints']       # (N, K, 2)
@@ -144,8 +165,18 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
                 vis = vis[..., 0]
 
             n = min(len(pred), len(gt))
+            # ori_shape is (H, W) of the original image the GT lives in
+            shape = data_sample.get('ori_shape')
             for i in range(n):
                 m = np.asarray(vis[i]) > 0
+                if self.ignore_out_of_bounds and shape is not None:
+                    h_img, w_img = shape[0], shape[1]
+                    g = np.asarray(gt[i])[:, :2]
+                    e = self.oob_margin_px
+                    inside = ((g[:, 0] >= -e) & (g[:, 0] <= w_img - 1 + e) &
+                              (g[:, 1] >= -e) & (g[:, 1] <= h_img - 1 + e))
+                    n_dropped += int((m & ~inside).sum())
+                    m = m & inside
                 if not m.any():
                     continue
                 pk = np.asarray(pred[i])[:, :2]
@@ -168,7 +199,9 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
 
                 self.results.append((idx, d.astype(np.float64), kpt_idx,
                                      data_sample['img_path'],
-                                     best_d.astype(np.float64), best_shift))
+                                     best_d.astype(np.float64), best_shift,
+                                     n_dropped))
+                n_dropped = 0
 
     def compute_metrics(self, results: list) -> Dict[str, float]:
         logger: MMLogger = MMLogger.get_current_instance()
@@ -177,7 +210,9 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
         offenders = defaultdict(list)   # (error, img_path, keypoint index)
         cyc = defaultdict(list)
         shifts = defaultdict(list)
-        for idx, d, kpt_idx, img_path, best_d, best_shift in results:
+        dropped = defaultdict(int)
+        for idx, d, kpt_idx, img_path, best_d, best_shift, n_oob in results:
+            dropped[idx] += n_oob
             grouped[idx].append(d)
             cyc[idx].append(best_d)
             shifts[idx].append(best_shift)
@@ -211,6 +246,13 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
                 f'{name}/n_keypoints': float(e.size),
             })
             per_domain_mean[name] = float(e.mean())
+            if self.ignore_out_of_bounds:
+                metrics[f'{name}/n_gt_out_of_bounds'] = float(dropped[idx])
+                if dropped[idx]:
+                    logger.info(
+                        f'[MultiDomainKeypointDistanceMetric] {name}: skipped '
+                        f'{dropped[idx]} ground-truth keypoints lying outside '
+                        'the image (the model is not trained on those either)')
 
             if self.report_cyclic and cyc[idx]:
                 ce = np.concatenate(cyc[idx])
