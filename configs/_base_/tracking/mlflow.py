@@ -11,7 +11,12 @@ vis_backends = [
         type='SafeMLflowVisBackend',
         exp_name='box-flap-pose',
         tracking_uri='http://10.200.104.2:31016',
-        artifact_suffix=['.py', '.pth', '.json']),
+        # MUST be a tuple: mmengine's scandir() rejects a list with
+        # '"suffix" must be a string or tuple of strings'. MLflowVisBackend
+        # calls it inside close(), so a list makes close() raise — which
+        # aborts artifact upload (this is why .pth files never reached MLflow)
+        # and skips mlflow.end_run(), leaving runs stuck in RUNNING.
+        artifact_suffix=('.py', '.pth', '.json')),
 ]
 visualizer = dict(
     type='PoseLocalVisualizer',
