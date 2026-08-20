@@ -57,6 +57,7 @@ custom_imports = dict(
         'mmpose.models.losses.geometric_loss',
         'mmpose.engine.vis_backends.safe_mlflow',
         'mmpose.evaluation.metrics.multi_domain_coco_metric',
+        'mmpose.evaluation.metrics.multi_domain_distance_metric',
     ],
     allow_failed_imports=False)
 
@@ -181,28 +182,60 @@ val_dataloader = dict(
         ],
         pipeline=val_pipeline))
 
-# Scores each domain separately and emits rsc/coco/AP, chewy/coco/AP and
-# min/coco/AP. Samples are routed by img_path against data_root, NOT img_id --
+# Two evaluators run together. Selection is on RAW PIXEL ERROR; coco/AP is
+# kept only for continuity with the historical runs.
+#
+# Why not AP: this project rewrites bboxes to full-image, so OKS takes
+# s = sqrt(image area) (296-725 px on the Chewy val). Even the strictest
+# threshold in AP@0.50:0.95 then tolerates ~33 px, while the model's median
+# error is ~3 px — AP saturates near 1.0 and cannot separate checkpoints.
+# Observed directly in run 21677dc6: chewy/coco/AP sat at 0.988-0.998 across
+# every epoch while rsc/coco/AP moved normally, so `min` was pinned to RSC and
+# the Chewy signal contributed nothing.
+#
+# Why not a size-normalised error: the model emits pixels and downstream
+# converts to physical units itself using the depth map, so dividing by image
+# size double-corrects. Dividing by crop diagonal would also over-correct —
+# crop size spans ~2.5x here while flap height (216-586 mm) implies far less
+# variation in true camera-to-corner distance.
+#
+# Samples are routed to a domain by img_path against data_root, NOT img_id:
 # the two annotation files both number from 1 and would otherwise collide.
-val_evaluator = dict(
-    _delete_=True,
-    type='MultiDomainCocoMetric',
-    domains=[
-        dict(name='rsc', data_root=rsc_root,
-             ann_file=f'{rsc_root}/annotations/person_keypoints_val.json'),
-        dict(name='chewy', data_root=chewy_val_root,
-             ann_file=f'{chewy_val_root}/annotations/person_keypoints_Train.json'),
-    ])
+val_evaluator = [
+    dict(
+        _delete_=True,
+        type='MultiDomainKeypointDistanceMetric',
+        domains=[
+            dict(name='rsc', data_root=rsc_root),
+            dict(name='chewy', data_root=chewy_val_root),
+        ],
+        # a corner off by this much is unusable for span metrology
+        fail_thr_px=20.0),
+    dict(
+        type='MultiDomainCocoMetric',
+        domains=[
+            dict(name='rsc', data_root=rsc_root,
+                 ann_file=f'{rsc_root}/annotations/person_keypoints_val.json'),
+            dict(name='chewy', data_root=chewy_val_root,
+                 ann_file=f'{chewy_val_root}/annotations/person_keypoints_Train.json'),
+        ]),
+]
 
-# Keep a best checkpoint per key. `best_min_coco_AP_epoch_N.pth` is the one to
-# ship; the per-domain bests are for diagnosis -- comparing them shows what the
-# "works everywhere" constraint cost on each side.
+# NOTE the criterion INVERTS versus an AP-style metric: with an error metric,
+# "works everywhere" means minimise the MAXIMUM — hence max/mean_px + 'less'.
+# `best_max_mean_px_epoch_N.pth` is the one to ship.
+#
+# mean_px drives selection rather than median deliberately: for corner-to-corner
+# metrology a large error does not degrade a measurement, it destroys it, and a
+# median shrugs those off. median_px is logged alongside so you can tell WHY
+# mean moved — mean up with median flat means new catastrophic failures; both
+# up means broad degradation.
 default_hooks = dict(
     checkpoint=dict(
         type='CheckpointHook',
         interval=10,
-        save_best=['min/coco/AP', 'rsc/coco/AP', 'chewy/coco/AP'],
-        rule='greater'))
+        save_best=['max/mean_px', 'rsc/mean_px', 'chewy/mean_px'],
+        rule='less'))
 
 # ---------------------------------------------------------------- schedule
 # Stage 2's schedule verbatim — starting from the synthetic pretrain, the model

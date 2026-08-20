@@ -1,0 +1,170 @@
+"""Raw pixel-distance keypoint metric, scored per deployment domain.
+
+Why pixels rather than OKS/AP or a size-normalised error:
+
+  * The model emits pixel coordinates and downstream converts to physical
+    units itself, using the depth map. A metric that divides by image size
+    applies a scale correction downstream already applies properly, per image
+    — double-correcting. Evaluate in the space the model is responsible for.
+  * coco/AP is blind at this accuracy level. Because this project rewrites
+    bboxes to full-image, OKS takes s = sqrt(image area) (296-725 px on the
+    Chewy val set), so even the strictest threshold in AP@0.50:0.95 tolerates
+    ~33 px of error while the model's median error is ~3 px. AP saturates
+    near 1.0 and cannot separate checkpoints.
+  * Dividing by image diagonal over-corrects: crop size spans ~2.5x on this
+    data, but flap height (216-586 mm) implies far less variation in actual
+    camera-to-corner distance.
+
+Selection uses `max/mean_px` with rule='less' — the checkpoint whose WORST
+domain has the lowest pixel error. Note the criterion inverts relative to an
+AP-style metric: "works everywhere" means minimise the maximum error.
+
+`mean_px` drives selection deliberately: for corner-to-corner metrology a
+large error does not degrade a measurement, it destroys it, and a median
+would shrug those off. `median_px` is logged alongside so you can tell why
+`mean_px` moved — mean up with median flat means new catastrophic failures;
+both up means broad degradation.
+
+Unlabelled ground-truth keypoints (visibility 0) are excluded, not scored as
+zero error. That matters here: on this data the SOUTH flap is often not
+visible, so a large fraction of val keypoints are v=0.
+
+Emits per domain:  <name>/mean_px, /median_px, /p90_px, /max_px,
+                   /n_over_20px, /frac_over_20px, /n_keypoints
+plus:              max/mean_px, max/domain_index
+
+Usage:
+    val_evaluator = [
+        dict(type='MultiDomainKeypointDistanceMetric',
+             domains=[dict(name='rsc',   data_root='data/RSC_Keypoints_RGBD'),
+                      dict(name='chewy', data_root='data/ChewyCrops')],
+             fail_thr_px=20.0),
+        dict(type='MultiDomainCocoMetric', domains=[...]),   # optional, for continuity
+    ]
+    default_hooks = dict(checkpoint=dict(
+        save_best=['max/mean_px'], rule='less'))
+"""
+import os.path as osp
+from collections import defaultdict
+from typing import Dict, List, Optional, Sequence
+
+import numpy as np
+from mmengine.evaluator import BaseMetric
+from mmengine.logging import MMLogger
+
+from mmpose.registry import METRICS
+
+
+@METRICS.register_module()
+class MultiDomainKeypointDistanceMetric(BaseMetric):
+    """Per-domain Euclidean keypoint error in pixels.
+
+    Args:
+        domains (list[dict]): One entry per deployment domain, each with
+            ``name`` and ``data_root``. Samples are routed by ``img_path``
+            against ``data_root`` (NOT by ``img_id``: separate COCO files
+            routinely reuse ids 1..N). Longest match wins, so nested roots
+            like data/ChewyCrops and data/ChewyCrops2 disambiguate correctly.
+        fail_thr_px (float): Errors at or above this count as unusable
+            corners. Defaults to 20.0.
+    """
+
+    default_prefix: Optional[str] = None
+
+    def __init__(self,
+                 domains: Sequence[dict],
+                 fail_thr_px: float = 20.0,
+                 collect_device: str = 'cpu',
+                 prefix: Optional[str] = None) -> None:
+        super().__init__(collect_device=collect_device, prefix=prefix)
+
+        if not domains:
+            raise ValueError('`domains` must list at least one domain')
+        for d in domains:
+            missing = {'name', 'data_root'} - set(d)
+            if missing:
+                raise ValueError(f'domain entry {d} is missing {sorted(missing)}')
+
+        self.domain_names: List[str] = [d['name'] for d in domains]
+        if len(set(self.domain_names)) != len(self.domain_names):
+            raise ValueError(f'duplicate domain names: {self.domain_names}')
+        self.fail_thr_px = float(fail_thr_px)
+        self._roots = sorted(
+            ((osp.normpath(d['data_root']), i) for i, d in enumerate(domains)),
+            key=lambda t: -len(t[0]))
+
+    def _route(self, img_path: str) -> int:
+        p = osp.normpath(img_path)
+        for root, idx in self._roots:
+            if p.startswith(root + osp.sep) or p == root:
+                return idx
+        raise ValueError(
+            f'sample {img_path!r} does not live under any configured '
+            f'data_root ({[r for r, _ in self._roots]}).')
+
+    def process(self, data_batch: Sequence[dict],
+                data_samples: Sequence[dict]) -> None:
+        for data_sample in data_samples:
+            idx = self._route(data_sample['img_path'])
+            pred = data_sample['pred_instances']['keypoints']       # (N, K, 2)
+            gt = data_sample['gt_instances']['keypoints']           # (N, K, 2)
+            vis = data_sample['gt_instances'].get('keypoints_visible')
+            if vis is None:
+                vis = np.ones(gt.shape[:2], dtype=bool)
+            vis = np.asarray(vis)
+            if vis.ndim == 3:            # some transforms carry a trailing dim
+                vis = vis[..., 0]
+
+            n = min(len(pred), len(gt))
+            for i in range(n):
+                m = np.asarray(vis[i]) > 0
+                if not m.any():
+                    continue
+                d = np.linalg.norm(
+                    np.asarray(pred[i])[m][:, :2] - np.asarray(gt[i])[m][:, :2],
+                    axis=-1)
+                self.results.append((idx, d.astype(np.float64)))
+
+    def compute_metrics(self, results: list) -> Dict[str, float]:
+        logger: MMLogger = MMLogger.get_current_instance()
+
+        grouped = defaultdict(list)
+        for idx, d in results:
+            grouped[idx].append(d)
+
+        metrics: Dict[str, float] = {}
+        per_domain_mean: Dict[str, float] = {}
+
+        for idx, name in enumerate(self.domain_names):
+            chunks = grouped.get(idx, [])
+            if not chunks:
+                logger.warning(
+                    f'[MultiDomainKeypointDistanceMetric] domain {name!r} '
+                    'received no samples — check the val dataloader.')
+                continue
+            e = np.concatenate(chunks)
+            over = float((e >= self.fail_thr_px).sum())
+            metrics.update({
+                f'{name}/mean_px': float(e.mean()),
+                f'{name}/median_px': float(np.median(e)),
+                f'{name}/p90_px': float(np.percentile(e, 90)),
+                f'{name}/max_px': float(e.max()),
+                f'{name}/n_over_{int(self.fail_thr_px)}px': over,
+                f'{name}/frac_over_{int(self.fail_thr_px)}px': float(over / e.size),
+                f'{name}/n_keypoints': float(e.size),
+            })
+            per_domain_mean[name] = float(e.mean())
+
+        if per_domain_mean:
+            worst = max(per_domain_mean, key=per_domain_mean.get)
+            metrics['max/mean_px'] = per_domain_mean[worst]
+            metrics['max/domain_index'] = float(self.domain_names.index(worst))
+            summary = '  '.join(
+                f'{n}={metrics[f"{n}/mean_px"]:.2f}px'
+                f'(med {metrics[f"{n}/median_px"]:.2f},'
+                f' >{int(self.fail_thr_px)}px {int(metrics[f"{n}/n_over_{int(self.fail_thr_px)}px"])})'
+                for n in per_domain_mean)
+            logger.info(
+                f'[MultiDomainKeypointDistanceMetric] {summary}  '
+                f'-> max={per_domain_mean[worst]:.2f}px (binding: {worst})')
+        return metrics
