@@ -74,8 +74,14 @@ def fix_file(path: Path, backup: bool, dry_run: bool) -> dict:
 
     if backup:
         bak_path = path.with_suffix(path.suffix + '.bak')
+        # Deliberately never overwrite an existing .bak: it is the pristine
+        # original, and clobbering it on a second run would destroy the only
+        # untouched copy. Report honestly which of the two happened.
         if not bak_path.exists():
             shutil.copy(path, bak_path)
+            summary['backup'] = 'created'
+        else:
+            summary['backup'] = 'kept existing (NOT overwritten)'
 
     with open(path, 'w') as f:
         json.dump(data, f)
@@ -122,7 +128,8 @@ def main():
             print(f'  FIXED {path}')
             print(f'        total={total}  already_full={already}  fixed={summary["fixed"]}')
             if not args.no_backup:
-                print(f'        backup: {path.with_suffix(path.suffix + ".bak")}')
+                print(f'        backup: {path.with_suffix(path.suffix + ".bak")}'
+                      f'  [{summary.get("backup", "n/a")}]')
 
 
 if __name__ == '__main__':

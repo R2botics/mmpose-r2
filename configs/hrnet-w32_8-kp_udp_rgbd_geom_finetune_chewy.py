@@ -56,6 +56,7 @@ custom_imports = dict(
         'mmpose.models.data_preprocessors.nchannel',
         'mmpose.models.losses.geometric_loss',
         'mmpose.engine.vis_backends.safe_mlflow',
+        'mmpose.evaluation.metrics.multi_domain_coco_metric',
     ],
     allow_failed_imports=False)
 
@@ -91,7 +92,8 @@ metainfo_file = 'configs/_base_/datasets/RSC_Keypoints.py'
 
 # Point these at wherever each set lives on the training box.
 rsc_root = 'data/RSC_Keypoints_RGBD'
-chewy_root = 'data/ChewyCrops2'
+chewy_root = 'data/ChewyCrops2'          # training set, captured 2026-08-18
+chewy_val_root = 'data/ChewyCrops'       # val set,      captured 2026-08-13
 
 train_pipeline = [
     dict(type='LoadRGBDImage'),
@@ -140,12 +142,67 @@ train_dataloader = dict(
         sample_ratio_factor=[1.0, 1.0],
         pipeline=train_pipeline))
 
-# Validation stays on the ORIGINAL real val split, and a plain CocoDataset,
-# because CocoMetric needs a single ann_file. It does NOT measure Chewy
-# performance — nothing does, since all 140 labelled Chewy images are in train.
-# Its job is to catch forgetting: if coco/AP falls well below the ~0.94
-# stage-2 plateau (~0.94), something is wrong. It should land in the same
-# range as stage 2, since this IS stage 2 with extra data.
+# ---------------------------------------------------------------- validation
+# BOTH RSC and Chewy are deployment targets, so the model is selected on
+# whichever it is WORSE at -- `min/coco/AP` -- rather than on either alone or
+# on their average. A mean lets a checkpoint buy Chewy accuracy with RSC
+# accuracy and still look good; the minimum only improves when the weaker
+# domain improves.
+#
+# The Chewy val is a held-out SESSION (captured 2026-08-13), not held-out
+# images from the training session (2026-08-18) -- zero filename overlap with
+# the 140 training images -- so it measures generalisation within the rig
+# rather than memorisation.
+val_pipeline = [
+    dict(type='LoadRGBDImage'),
+    dict(type='GetBBoxCenterScale'),
+    dict(type='TopdownAffine', input_size=(256, 256), use_udp=True),
+    dict(type='PackPoseInputs'),
+]
+
+val_dataloader = dict(
+    batch_size=16,
+    num_workers=4,
+    dataset=dict(
+        _delete_=True,
+        type='CombinedDataset',
+        metainfo=dict(from_file=metainfo_file),
+        datasets=[
+            dict(type='CocoDataset', data_root=rsc_root,
+                 ann_file='annotations/person_keypoints_val.json',
+                 data_prefix=dict(img='images/'),
+                 metainfo=dict(from_file=metainfo_file),
+                 test_mode=True, pipeline=[]),
+            dict(type='CocoDataset', data_root=chewy_val_root,
+                 ann_file='annotations/person_keypoints_Train.json',
+                 data_prefix=dict(img='images/'),
+                 metainfo=dict(from_file=metainfo_file),
+                 test_mode=True, pipeline=[]),
+        ],
+        pipeline=val_pipeline))
+
+# Scores each domain separately and emits rsc/coco/AP, chewy/coco/AP and
+# min/coco/AP. Samples are routed by img_path against data_root, NOT img_id --
+# the two annotation files both number from 1 and would otherwise collide.
+val_evaluator = dict(
+    _delete_=True,
+    type='MultiDomainCocoMetric',
+    domains=[
+        dict(name='rsc', data_root=rsc_root,
+             ann_file=f'{rsc_root}/annotations/person_keypoints_val.json'),
+        dict(name='chewy', data_root=chewy_val_root,
+             ann_file=f'{chewy_val_root}/annotations/person_keypoints_Train.json'),
+    ])
+
+# Keep a best checkpoint per key. `best_min_coco_AP_epoch_N.pth` is the one to
+# ship; the per-domain bests are for diagnosis -- comparing them shows what the
+# "works everywhere" constraint cost on each side.
+default_hooks = dict(
+    checkpoint=dict(
+        type='CheckpointHook',
+        interval=10,
+        save_best=['min/coco/AP', 'rsc/coco/AP', 'chewy/coco/AP'],
+        rule='greater'))
 
 # ---------------------------------------------------------------- schedule
 # Stage 2's schedule verbatim — starting from the synthetic pretrain, the model
