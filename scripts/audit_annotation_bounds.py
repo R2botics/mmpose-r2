@@ -74,6 +74,13 @@ def main():
                     help='rewrite out-of-bounds v=1/v=2 to v=0 and recompute '
                          'num_keypoints')
     ap.add_argument('--no-backup', action='store_true')
+    ap.add_argument('--check-convention', action='store_true',
+                    help='Also report annotations that violate the flap '
+                         'convention (NORTH/SOUTH = the two SHORT minor flaps, '
+                         'EAST/WEST = the two LONG major flaps). A violation is '
+                         'a 90-degree clocked label, which -- unlike an '
+                         'out-of-bounds point -- carries FULL gradient during '
+                         'training and actively teaches the wrong assignment.')
     args = ap.parse_args()
 
     for f in args.files:
@@ -113,6 +120,44 @@ def main():
 
         byname = collections.Counter(r['name'] for r in oob)
         print(f'\n  by keypoint: {dict(byname.most_common())}')
+
+        if args.check_convention:
+            imgs = {i['id']: i for i in data['images']}
+            PAIRS = {'NORTH': (0, 1), 'EAST': (2, 3), 'SOUTH': (4, 5), 'WEST': (6, 7)}
+            viol, near, ok = [], 0, 0
+            for ann in data['annotations']:
+                im = imgs.get(ann['image_id'])
+                if im is None:
+                    continue
+                k = [ann['keypoints'][i:i + 3] for i in range(0, len(ann['keypoints']), 3)]
+                span = {}
+                for nm, (a_, b_) in PAIRS.items():
+                    if k[a_][2] > 0 and k[b_][2] > 0:
+                        span[nm] = ((k[a_][0] - k[b_][0]) ** 2 +
+                                    (k[a_][1] - k[b_][1]) ** 2) ** 0.5
+                if len(span) < 4:
+                    continue
+                ns = (span['NORTH'] + span['SOUTH']) / 2
+                ew = (span['EAST'] + span['WEST']) / 2
+                if ns >= ew:
+                    viol.append((ns / ew, im['file_name'], span))
+                elif abs(ns / ew - 1) < 0.10:
+                    near += 1
+                else:
+                    ok += 1
+            total = len(viol) + near + ok
+            print(f'\n  convention check (N/S should be the SHORT flaps):')
+            print(f'    fully-labelled boxes: {total}')
+            print(f'    respects convention : {ok}')
+            print(f'    near-square (ambiguous, within 10%): {near}')
+            print(f'    VIOLATIONS (90deg clocked): {len(viol)}'
+                  f'  = {100*len(viol)/max(total,1):.1f}%')
+            for r, fn, sp in sorted(viol, key=lambda t: -t[0])[:10]:
+                print(f'      ratio {r:.2f}  N={sp["NORTH"]:.0f} S={sp["SOUTH"]:.0f} | '
+                      f'E={sp["EAST"]:.0f} W={sp["WEST"]:.0f}   {fn[:52]}')
+            if viol:
+                print('    -> these carry FULL gradient in training, unlike '
+                      'out-of-bounds points (weight 0).')
 
         if args.fix:
             if not args.no_backup:
