@@ -79,6 +79,7 @@ class GeometricKeypointMSELoss(KeypointMSELoss):
                  parallel_weight: float = 0.03,
                  span_weight: float = 0.0,
                  span_tolerance: float = 0.01,
+                 absent_weight: float = 0.0,
                  tolerance_deg: float = 10.0,
                  softmax_temp: float = 10.0,
                  warmup_steps: int = 0,
@@ -93,6 +94,7 @@ class GeometricKeypointMSELoss(KeypointMSELoss):
         self.parallel_weight = parallel_weight
         self.span_weight = span_weight
         self.span_tolerance = span_tolerance
+        self.absent_weight = absent_weight
         self.tolerance_deg = tolerance_deg
         self.softmax_temp = softmax_temp
         self.warmup_steps = warmup_steps
@@ -184,8 +186,35 @@ class GeometricKeypointMSELoss(KeypointMSELoss):
                 target: Tensor,
                 target_weights: Optional[Tensor] = None,
                 mask: Optional[Tensor] = None) -> Tensor:
+        # Visibility for the GEOMETRIC terms must come from the ORIGINAL
+        # weights: an absent keypoint has no meaningful coordinate, so it must
+        # never enter the perpendicular / parallel / span computations.
+        vis = self._per_keypoint_visibility(target_weights)
+
+        # Absent-keypoint suppression.
+        #
+        # The codec already emits an ALL-ZERO target heatmap for a v=0 keypoint
+        # -- it is the accompanying weight of 0 that throws that supervision
+        # away, leaving the channel with exactly zero gradient. The model is
+        # therefore never told that an absent corner means "output nothing",
+        # and it learns to peak on whatever looks corner-like: measured on
+        # ChewyCrops, 169 corners that do not exist in the image still peak at
+        # a mean of 0.83, with 70% above 0.8 -- indistinguishable from the 0.96
+        # of real detections, so no confidence gate can separate them.
+        #
+        # Restoring a nonzero weight turns that existing zero target into
+        # suppression. Note this needs no new magic constant: absent_weight=1.0
+        # simply means "train this channel like any other", and the target it
+        # is trained against is the codec's own output.
+        mse_weights = target_weights
+        if self.absent_weight > 0 and target_weights is not None:
+            absent = (target_weights == 0)
+            if absent.any():
+                mse_weights = target_weights.clone()
+                mse_weights[absent] = self.absent_weight
+
         # Standard heatmap MSE — always runs at full weight
-        mse_loss = super().forward(output, target, target_weights, mask)
+        mse_loss = super().forward(output, target, mse_weights, mask)
 
         # Warmup ramp on the geometric weights. Returns 0 → 1 over warmup_steps,
         # then stays at 1. Lets the model first learn to make peaked heatmaps
@@ -201,7 +230,8 @@ class GeometricKeypointMSELoss(KeypointMSELoss):
             return mse_loss
 
         coords = self._soft_argmax(output)                  # (B, K, 2)
-        vis = self._per_keypoint_visibility(target_weights)  # (B, K) or None
+        # `vis` was computed from the ORIGINAL target_weights above, so absent
+        # keypoints stay excluded from every geometric term.
 
         # Perpendicularity: |cos(angle)| should be ≤ sin(tolerance) --> no penalty
         perp_loss = 0.0
