@@ -58,6 +58,11 @@ model = dict(
 train_pipeline_384 = [
     dict(type='LoadRGBDImage'),
     dict(type='GetBBoxCenterScale'),
+    # See the note in the 256 config: horizontal mirror, keypoint permutation
+    # comes from the `swap=` fields in the dataset metainfo.
+    dict(type='RandomFlip', direction='horizontal'),
+    # See the 256 config: RandomFlipVertical, NOT RandomFlip('vertical').
+    dict(type='RandomFlipVertical', prob=0.5),
     dict(type='RandomBBoxTransform',
          shift_factor=0.1, scale_factor=[0.75, 1.25], rotate_factor=30),
     dict(type='TopdownAffine', input_size=(384, 384), use_udp=True),

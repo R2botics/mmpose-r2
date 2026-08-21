@@ -14,6 +14,8 @@ from mmcv.transforms import BaseTransform
 
 from mmpose.registry import TRANSFORMS
 
+from .common_transforms import RandomFlip
+
 
 @TRANSFORMS.register_module()
 class LoadRGBDImage(BaseTransform):
@@ -114,4 +116,78 @@ class PhotometricDistortionRGBOnly(BaseTransform):
 
         # Recombine
         results['img'] = np.concatenate([photo_results['img'], extra], axis=2)
+        return results
+
+
+@TRANSFORMS.register_module()
+class RandomFlipVertical(RandomFlip):
+    """Top-bottom mirror with the correct keypoint permutation.
+
+    Plain ``RandomFlip(direction='vertical')`` is WRONG for this dataset.
+    ``flip_keypoints()`` applies ``results['flip_indices']`` for both
+    directions, and ``flip_indices`` is built from the ``swap=`` fields in the
+    dataset metainfo, which describe the HORIZONTAL mirror. Using it for a
+    vertical flip permutes keypoints into the wrong channels and raises no
+    error -- the run just trains on corrupted labels.
+
+    The vertical permutation differs because a top-bottom mirror moves NORTH
+    onto SOUTH, while a left-right mirror keeps NORTH at the top:
+
+        horizontal:  N1<->N2  E1<->W2  E2<->W1  S1<->S2   (metainfo `swap=`)
+        vertical:    N1<->S2  N2<->S1  E1<->E2  W1<->W2   (this transform)
+
+    Derived from the mean keypoint layout in the box's own frame: each physical
+    box corner carries one N/S-flap keypoint and one E/W-flap keypoint, and a
+    vertical mirror maps a corner to the one below/above it while keeping each
+    keypoint within its own flap family.
+
+    Why bother: the Chewy crops label ``E2/S1/S2/W1`` on only ~half as many
+    boxes as ``N1/N2/E1/W2`` (those corners fall outside the crop), leaving a
+    19%-of-mean spread in per-channel supervision. Horizontal flip cannot fix
+    it -- it pairs (E2,W1) and (S1,S2), which are BOTH starved. Vertical flip
+    pairs each starved channel with an abundant one and cuts the spread to 3%.
+
+    Composes with the horizontal flip: applying both gives the full
+    {identity, H, V, 180-degree rotation} group.
+
+    Args:
+        prob: Probability of flipping. Defaults to 0.5.
+        flip_indices: Override the vertical permutation. Defaults to the
+            8-keypoint box layout above.
+    """
+
+    #: N1<->S2, N2<->S1, E1<->E2, W1<->W2
+    DEFAULT_VERTICAL_FLIP_INDICES = [5, 4, 3, 2, 1, 0, 7, 6]
+
+    def __init__(self, prob=0.5, flip_indices=None):
+        super().__init__(prob=prob, direction='vertical')
+        self.vertical_flip_indices = (
+            list(flip_indices) if flip_indices is not None
+            else list(self.DEFAULT_VERTICAL_FLIP_INDICES))
+
+    def transform(self, results: dict) -> dict:
+        # Substitute the vertical permutation for the duration of the call,
+        # then restore. `flip_indices` is carried into metainfo by
+        # PackPoseInputs and reused by flip_test at inference, where the
+        # HORIZONTAL indices are the correct ones -- so leaving ours behind
+        # would silently break test-time flip augmentation.
+        saved_indices = results.get('flip_indices')
+        # A horizontal RandomFlip earlier in the pipeline may already have set
+        # these; super().transform() overwrites them unconditionally, so keep
+        # the record that a flip happened.
+        was_flipped = results.get('flip', False)
+        prev_direction = results.get('flip_direction')
+
+        results['flip_indices'] = self.vertical_flip_indices
+        try:
+            results = super().transform(results)
+        finally:
+            if saved_indices is not None:
+                results['flip_indices'] = saved_indices
+            else:
+                results.pop('flip_indices', None)
+
+        if was_flipped and not results.get('flip', False):
+            results['flip'] = True
+            results['flip_direction'] = prev_direction
         return results

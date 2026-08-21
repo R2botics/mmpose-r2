@@ -104,6 +104,30 @@ chewy_val_root = 'data/ChewyCrops'       # val set,      captured 2026-08-13
 train_pipeline = [
     dict(type='LoadRGBDImage'),
     dict(type='GetBBoxCenterScale'),
+    # Horizontal mirror. NOT a top-bottom flip: NORTH stays the top flap and
+    # only its two endpoints swap (N1<->N2); EAST becomes WEST with the corner
+    # winding reversed (E1->W2, E2->W1). mmpose reads that permutation from the
+    # `swap=` fields in configs/_base_/datasets/RSC_Keypoints.py, which already
+    # encode exactly this. Mirroring preserves lengths, so the short=N/S,
+    # long=E/W convention survives. LoadRGBDImage stacks R,G,B,depth,mask into
+    # one HxWx5 array and mmcv.imflip reverses all five together, so depth and
+    # mask stay registered with colour.
+    dict(type='RandomFlip', direction='horizontal'),
+    # Top-bottom mirror. MUST be RandomFlipVertical, not
+    # RandomFlip(direction='vertical'): mmpose applies results['flip_indices']
+    # for both directions, and those indices encode the HORIZONTAL swap, so
+    # the built-in transform would permute keypoints into the wrong channels
+    # with no error raised.
+    #
+    # This is the augmentation that fixes per-channel supervision imbalance.
+    # The Chewy crops label E2/S1/S2/W1 on only ~half as many boxes as
+    # N1/N2/E1/W2 (those corners fall outside the crop), a 19%-of-mean spread.
+    # Horizontal flip cannot help: it pairs (E2,W1) and (S1,S2), both starved.
+    # Vertical flip pairs each starved channel with an abundant one:
+    #     N1<->S2   N2<->S1   E1<->E2   W1<->W2      -> spread drops to 3%.
+    # Together with the horizontal flip this gives the full
+    # {identity, H, V, 180-degree rotation} group.
+    dict(type='RandomFlipVertical', prob=0.5),
     dict(type='RandomBBoxTransform',
          shift_factor=0.1, scale_factor=[0.75, 1.25], rotate_factor=30),
     dict(type='TopdownAffine', input_size=(256, 256), use_udp=True),
@@ -307,21 +331,42 @@ test_evaluator = [
 # ---------------------------------------------------------------- schedule
 # Stage 2's schedule verbatim — starting from the synthetic pretrain, the model
 # has to actually learn the real domain, not just nudge toward a new rig.
+# AdamW rather than plain Adam. Train loss falls monotonically (4.5x over a
+# run) while val plateaus around epoch 80-100 -- overfitting on 428 images, not
+# an LR problem. Adam's default weight_decay is 0, so there was no regulariser
+# at all. LR itself is unchanged: tuning it fits the same 428 images faster or
+# slower without adding information.
 optim_wrapper = dict(
-    optimizer=dict(lr=1e-4),
+    optimizer=dict(type='AdamW', lr=1e-4, weight_decay=1e-4),
     paramwise_cfg=dict(
         bypass_duplicate=True,
         custom_keys=dict(backbone=dict(lr_mult=0.5))))
 
 # 288 + 140 = 428 effective samples / batch 16 = 27 iters per epoch.
-train_cfg = dict(by_epoch=True, max_epochs=150, val_interval=10)
+# 150 -> 100 epochs: val stops improving by ~epoch 80 while cosine kept
+# annealing to 150, so the last third of every run was spent below lr 2e-5
+# producing nothing. Same result, two-thirds the compute.
+train_cfg = dict(by_epoch=True, max_epochs=100, val_interval=10)
 
 # Same as stage 2: heatmaps from the synthetic pretrain are already well-formed,
 # so the geometric prior can engage quickly. 200 steps ~ 7 epochs here.
-model = dict(head=dict(loss=dict(warmup_steps=200)))
+# The span term rides the same warmup ramp -- it reads coordinates out of the
+# heatmaps via soft-argmax, so it is meaningless until the peaks are sharp.
+model = dict(
+    head=dict(
+        loss=dict(
+            warmup_steps=200,
+            # Flap length is what downstream measures and what neither angular
+            # term can see. Weight is the one knob here that wants a sweep:
+            # the angular terms sit at 0.005 but are near-zero in practice
+            # (their free zones are rarely violated), whereas this term fires
+            # on the ~2.5% typical span error, so a comparable weight would be
+            # far too weak. 0.1 puts it at roughly a third of the MSE term.
+            span_weight=0.1,
+            span_tolerance=0.01)))
 
 param_scheduler = [
     dict(type='LinearLR', start_factor=1.0e-5, by_epoch=False,
          begin=0, end=50),
-    dict(type='CosineAnnealingLR', eta_min=0, begin=0, end=150, by_epoch=True),
+    dict(type='CosineAnnealingLR', eta_min=0, begin=0, end=100, by_epoch=True),
 ]

@@ -6,6 +6,9 @@ are bent up around their hinge axes:
 
   * PERPENDICULARITY between adjacent flap edges (NORTH ⊥ EAST etc.)
   * PARALLELISM between opposite flap edges (NORTH ∥ SOUTH etc.)
+  * SPAN: predicted flap length matches the labelled flap length. Optional
+    (`span_weight=0.0` by default). The two angular terms normalise their edge
+    vectors and so cannot see length at all -- see the note in forward().
 
 Both penalties have a `tolerance_deg` "free zone" so small perspective
 distortion (e.g. ~10° camera tilt) doesn't get penalised. Keypoints are
@@ -30,8 +33,19 @@ class GeometricKeypointMSELoss(KeypointMSELoss):
     Args:
         perp_weight:        Weight on the perpendicularity term.
         parallel_weight:    Weight on the parallelism term.
+        span_weight:        Weight on the flap-length term. Defaults to 0.0
+                            (disabled) so existing configs are unchanged.
+                            The other two terms constrain edge direction only;
+                            this one constrains edge LENGTH, which is what
+                            downstream actually measures.
+        span_tolerance:     Relative slack on flap length (0.01 = 1%) before
+                            the span term incurs any penalty. Mirrors the
+                            `tolerance_deg` free zone of the angular terms.
         tolerance_deg:      Angular slack (degrees) before each term incurs
                             any penalty. Keep at ~10 for slight perspective.
+                            Measured max in the labels is 8.8 deg, so 10 has
+                            little headroom -- widen if production sees more
+                            steeply angled views than the training data.
         softmax_temp:       Temperature for soft-argmax. Larger = sharper
                             peak (closer to true argmax). 10.0 works well.
         perpendicular_pairs: Edge-pairs that should be perpendicular, each
@@ -53,10 +67,18 @@ class GeometricKeypointMSELoss(KeypointMSELoss):
         ((0, 1), (4, 5)),  # NORTH ∥ SOUTH
         ((2, 3), (6, 7)),  # EAST  ∥ WEST
     )
+    DEFAULT_SPAN_EDGES = (
+        (0, 1),  # NORTH span
+        (2, 3),  # EAST  span
+        (4, 5),  # SOUTH span
+        (6, 7),  # WEST  span
+    )
 
     def __init__(self,
                  perp_weight: float = 0.03,
                  parallel_weight: float = 0.03,
+                 span_weight: float = 0.0,
+                 span_tolerance: float = 0.01,
                  tolerance_deg: float = 10.0,
                  softmax_temp: float = 10.0,
                  warmup_steps: int = 0,
@@ -64,10 +86,13 @@ class GeometricKeypointMSELoss(KeypointMSELoss):
                      Tuple[Tuple[int, int], Tuple[int, int]]]] = None,
                  parallel_pairs: Optional[Sequence[
                      Tuple[Tuple[int, int], Tuple[int, int]]]] = None,
+                 span_edges: Optional[Sequence[Tuple[int, int]]] = None,
                  **kwargs):
         super().__init__(**kwargs)
         self.perp_weight = perp_weight
         self.parallel_weight = parallel_weight
+        self.span_weight = span_weight
+        self.span_tolerance = span_tolerance
         self.tolerance_deg = tolerance_deg
         self.softmax_temp = softmax_temp
         self.warmup_steps = warmup_steps
@@ -83,6 +108,9 @@ class GeometricKeypointMSELoss(KeypointMSELoss):
         self.parallel_pairs = (parallel_pairs
                                if parallel_pairs is not None
                                else self.DEFAULT_PARALLEL_PAIRS)
+        self.span_edges = (span_edges
+                           if span_edges is not None
+                           else self.DEFAULT_SPAN_EDGES)
 
         # Pre-compute cosine thresholds for the free-zone clamps
         # For perpendicular: |cos(angle)| should be small. The free zone is
@@ -133,6 +161,15 @@ class GeometricKeypointMSELoss(KeypointMSELoss):
         if vis is None:
             return v, None
         return v, vis[:, a] * vis[:, b]                                 # (B,)
+
+    @staticmethod
+    def _edge_len_and_vis(coords, vis, edge):
+        """Unnormalised edge LENGTH -- the quantity _edge_vec_and_vis discards."""
+        a, b = edge
+        length = torch.linalg.vector_norm(coords[:, b] - coords[:, a], dim=-1)
+        if vis is None:
+            return length, None
+        return length, vis[:, a] * vis[:, b]                            # (B,)
 
     def _reduce_with_vis(self, term: Tensor, vis_mask: Optional[Tensor]) -> Tensor:
         """Average `term` (B,) over visible samples; falls back to plain mean."""
@@ -190,6 +227,46 @@ class GeometricKeypointMSELoss(KeypointMSELoss):
             parallel_loss = parallel_loss + self._reduce_with_vis(term, edge_vis)
         parallel_loss = parallel_loss / len(self.parallel_pairs)
 
+        # Span: predicted flap LENGTH should match the labelled length.
+        #
+        # Both terms above normalise their edge vectors, so they constrain edge
+        # DIRECTION and are completely blind to edge LENGTH. A flap that is
+        # perfectly parallel to its opposite and perpendicular to its neighbours
+        # but 30px too short costs exactly zero. Measured on the OOD set, that
+        # shows up as error running ALONG the edges (1.39x the across-edge
+        # component; 2.48x at SOUTH_1) and flap spans reading too SHORT on 80%
+        # of NORTH/SOUTH edges. Downstream measures corner-to-corner span, so
+        # that bias lands straight in the product measurement.
+        #
+        # The target length is read from the GT heatmap with the SAME
+        # soft-argmax used on the prediction. That matters: soft-argmax over a
+        # full heatmap pulls slightly toward the centre, so using an exact
+        # centroid for the target and soft-argmax for the prediction would make
+        # correct predictions look short and push the model to overshoot. Same
+        # operator on both sides cancels the bias to first order.
+        #
+        # NOT an opposite-edge equality constraint (|NORTH| == |SOUTH|): under
+        # perspective a nearer flap genuinely images longer than the far one.
+        # Measured in the labels, opposite-edge ratios reach 1.18 at p90 and
+        # 1.59 at max, so equality would be wrong by more than the bias it aims
+        # to fix. Comparing against the per-image label keeps perspective in the
+        # target where it belongs.
+        span_loss = 0.0
+        if self.span_weight > 0:
+            with torch.no_grad():
+                gt_coords = self._soft_argmax(target)
+            for edge in self.span_edges:
+                len_pred, edge_vis = self._edge_len_and_vis(coords, vis, edge)
+                len_gt, _ = self._edge_len_and_vis(gt_coords, vis, edge)
+                rel_err = (len_pred - len_gt).abs() / len_gt.clamp(min=1e-3)
+                # Free zone, matching the design of the two angular terms: no
+                # penalty inside `span_tolerance` so the term does not chase
+                # annotation noise.
+                term = torch.clamp(rel_err - self.span_tolerance, min=0.0) ** 2
+                span_loss = span_loss + self._reduce_with_vis(term, edge_vis)
+            span_loss = span_loss / len(self.span_edges)
+
         return (mse_loss
                 + ramp * self.perp_weight * perp_loss
-                + ramp * self.parallel_weight * parallel_loss)
+                + ramp * self.parallel_weight * parallel_loss
+                + ramp * self.span_weight * span_loss)
