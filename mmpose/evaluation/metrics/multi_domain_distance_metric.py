@@ -141,6 +141,19 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
             ((osp.normpath(d['data_root']), i) for i, d in enumerate(domains)),
             key=lambda t: -len(t[0]))
 
+    #: The four PHYSICAL box corners. Each is marked by two keypoints -- one
+    #: from an N/S flap and one from an E/W flap -- and the model routinely
+    #: collapses the two onto a single point. Measured on Chewy+OOD: 6% of
+    #: pairs collapse (predicted separation < half of GT) yet carry 16% of all
+    #: error, because collapse rate rises with true separation (4% under 10px,
+    #: 22% over 40px). The cause is resolution: median separation is 1.89
+    #: heatmap px against sigma=2, so 54% of training pairs are closer than one
+    #: sigma and the two target blobs are nearly the same blob.
+    #:
+    #: Nothing else in this metric sees it -- a collapsed pair just looks like
+    #: two mediocre keypoints -- which is why it needs its own counter.
+    CORNER_PAIRS = ((0, 7), (1, 2), (3, 4), (5, 6))
+
     def _route(self, img_path: str) -> int:
         p = osp.normpath(img_path)
         for root, idx in self._roots:
@@ -197,10 +210,22 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
                         if cand.mean() < best_d.mean():
                             best_d, best_shift = cand, shift
 
+                # corner-pair separation: (gt_sep, pred_sep, summed pair error)
+                pairs = []
+                if pk.shape[0] == 8:
+                    for a, b in self.CORNER_PAIRS:
+                        if not (m[a] and m[b]):
+                            continue
+                        gsep = float(np.linalg.norm(gk[b] - gk[a]))
+                        psep = float(np.linalg.norm(pk[b] - pk[a]))
+                        perr = float(np.linalg.norm(pk[a] - gk[a]) +
+                                     np.linalg.norm(pk[b] - gk[b]))
+                        pairs.append((gsep, psep, perr))
+
                 self.results.append((idx, d.astype(np.float64), kpt_idx,
                                      data_sample['img_path'],
                                      best_d.astype(np.float64), best_shift,
-                                     n_dropped))
+                                     n_dropped, pairs))
                 n_dropped = 0
 
     def compute_metrics(self, results: list) -> Dict[str, float]:
@@ -211,8 +236,10 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
         cyc = defaultdict(list)
         shifts = defaultdict(list)
         dropped = defaultdict(int)
-        for idx, d, kpt_idx, img_path, best_d, best_shift, n_oob in results:
+        pairs_by_domain = defaultdict(list)
+        for idx, d, kpt_idx, img_path, best_d, best_shift, n_oob, prs in results:
             dropped[idx] += n_oob
+            pairs_by_domain[idx].extend(prs)
             grouped[idx].append(d)
             cyc[idx].append(best_d)
             shifts[idx].append(best_shift)
@@ -246,6 +273,38 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
                 f'{name}/n_keypoints': float(e.size),
             })
             per_domain_mean[name] = float(e.mean())
+
+            # Collapsed corner pairs. `pair_sep_ratio` is the headline: 1.0
+            # means the model reproduces the true corner separation, and it
+            # sits near 0.72 today because predictions shrink toward the
+            # typical ~10px separation regardless of the actual box.
+            prs = pairs_by_domain.get(idx, [])
+            if prs:
+                gsep = np.array([p[0] for p in prs])
+                psep = np.array([p[1] for p in prs])
+                perr = np.array([p[2] for p in prs])
+                collapsed = psep < 0.5 * gsep
+                ok = gsep > 1e-6
+                metrics.update({
+                    f'{name}/n_corner_pairs': float(len(prs)),
+                    f'{name}/n_collapsed_pairs': float(collapsed.sum()),
+                    f'{name}/frac_collapsed_pairs': float(collapsed.mean()),
+                    # MEDIAN, not mean: pairs with a tiny true separation give
+                    # huge pred/gt ratios and drag the mean above 1.0 even
+                    # while the model is systematically shrinking separations.
+                    f'{name}/pair_sep_ratio': float(
+                        np.median(psep[ok] / gsep[ok])) if ok.any() else 0.0,
+                    # Slope of predicted-vs-true separation. This is the one
+                    # that shows the shrinkage: 1.0 = faithful, and it sits
+                    # near 0.72 today because predictions regress toward the
+                    # typical ~10px corner separation whatever the box does.
+                    f'{name}/pair_sep_slope': float(
+                        np.polyfit(gsep[ok], psep[ok], 1)[0])
+                    if ok.sum() > 1 else 0.0,
+                    f'{name}/collapsed_err_share': float(
+                        perr[collapsed].sum() / perr.sum())
+                    if perr.sum() > 0 else 0.0,
+                })
             if self.ignore_out_of_bounds:
                 metrics[f'{name}/n_gt_out_of_bounds'] = float(dropped[idx])
                 if dropped[idx]:
