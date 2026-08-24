@@ -7,9 +7,11 @@ as one that dies at iteration 1.
 
 CHECKS
   1. SCHEMA     8 keypoints, 24-long arrays, category names matching ours.
-  2. CONVENTION the minimum-distance corner pairing (see
-                diagnose_synth_pairs.py) -- renumbered indices would teach the
-                wrong corner identities.
+  2. CONVENTION the minimum-distance corner pairing (shared with
+                diagnose_synth_pairs.py). Renumbered indices would teach the
+                wrong corner identities, so this is a hard stop -- but only
+                for the renumbering PATTERN, since a very wide set fails the
+                same test for purely geometric reasons.
   3. FILES      color images resolve under <root>/images/ with the suffix
                 LoadRGBDImage expects, and each has a matching depth file
                 under <root>/depth/ with the same HxW. This is the check that
@@ -81,27 +83,32 @@ def main():
             if len(a.get('keypoints', [])) == 24
             and (np.array(a['keypoints'], float).reshape(-1, 3)[:, 2] > 0).all()]
     if full:
-        from itertools import product  # noqa: F401  (kept for clarity)
+        # Shares the discriminator with diagnose_synth_pairs.py rather than
+        # re-deriving it: a WIDE set legitimately fails the minimum-distance
+        # test on its most open boxes, so the raw rate is not a pass/fail
+        # signal. Only a RENUMBERING pattern -- failures spread evenly across
+        # geometry with one alternative pairing dominating -- is a hard stop.
+        from diagnose_synth_pairs import classify_convention
 
-        def matchings(items):
-            if not items:
-                yield ()
-                return
-            first, rest = items[0], items[1:]
-            for k in range(len(rest)):
-                for tail in matchings(rest[:k] + rest[k + 1:]):
-                    yield ((first, rest[k]),) + tail
-
-        allm = list(matchings(tuple(range(8))))
-        ours = set(map(frozenset, PAIRS))
-        wins = 0
-        for k in full:
-            d = np.linalg.norm(k[:, None] - k[None, :], axis=-1)
-            best = min(allm, key=lambda m: sum(d[i, j] for i, j in m))
-            wins += set(map(frozenset, best)) == ours
-        frac = wins / len(full)
-        check('minimum-distance pairing recovers our corner convention',
-              frac > 0.90, f'{frac:.1%} of {len(full)} fully-visible boxes')
+        c = classify_convention(full)
+        detail = f'{c["frac_ok"]:.1%} of {len(full)} fully-visible boxes'
+        if c['verdict'] in ('ok', 'geometry'):
+            check('corner convention matches ours', True,
+                  f'{detail}'
+                  + ('' if c['verdict'] == 'ok' else
+                     f'; the {c["n_fail"]} failures are '
+                     f'{c["q4_share"]:.0%} concentrated in the widest '
+                     f'quartile, which is wide geometry, not renumbering'))
+        elif c['verdict'] == 'renumbering':
+            check('corner convention matches ours', False,
+                  f'{detail}; one alternative pairing takes '
+                  f'{c["top_share"]:.0%} of failures and they do NOT track '
+                  f'how open the flaps are -- the indices look permuted')
+        else:
+            check('corner convention matches ours', False,
+                  f'{detail}; verdict {c["verdict"]} -- run '
+                  f'scripts/diagnose_synth_pairs.py for the breakdown',
+                  fatal=False)
     else:
         check('fully-visible boxes available to test convention', False,
               'none found', fatal=False)

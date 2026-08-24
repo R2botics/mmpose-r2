@@ -70,6 +70,87 @@ def load(path):
     return boxes, data.get('categories', [])
 
 
+def classify_convention(boxes):
+    """Does this set use our corner convention? Returns a verdict dict.
+
+    The minimum-distance test assumes the two keypoints marking one corner are
+    closer to each other than to anything else. Splay the flaps far enough and
+    that stops holding WITHOUT any relabelling -- so a shortfall alone does not
+    imply scrambled indices. What separates the two cases is the PATTERN:
+
+        failures concentrated in the widest boxes -> geometry, set is fine
+        failures flat across separation, with one
+        alternative pairing dominating            -> systematic renumbering
+
+    Verdicts: 'ok', 'geometry', 'renumbering', 'inconclusive', 'too_few'.
+    """
+    ours = set(map(frozenset, PAIRS))
+    rank, best_per_box = [], []
+    for k in boxes:
+        d = np.linalg.norm(k[:, None, :] - k[None, :, :], axis=-1)
+        totals = np.array([sum(d[i, j] for i, j in m) for m in MATCHINGS])
+        best_per_box.append(MATCHINGS[int(totals.argmin())])
+        rank.append(int((totals < sum(d[i, j] for i, j in PAIRS) - 1e-9).sum()) + 1)
+
+    rank = np.array(rank)
+    ok_mask = rank == 1
+    n_fail = int((~ok_mask).sum())
+    votes = Counter(best_per_box)
+    res = dict(n=len(boxes), frac_ok=float(ok_mask.mean()), n_fail=n_fail,
+               rank=rank, votes=votes, quartiles=[], q4_share=0.0,
+               top_share=0.0, alt=Counter(), verdict='ok')
+    if not n_fail:
+        return res
+
+    sep = np.array([
+        np.mean([np.linalg.norm(k[j] - k[i]) for i, j in PAIRS])
+        / max(np.sqrt(np.ptp(k[:, 0]) * np.ptp(k[:, 1])), 1e-6) for k in boxes])
+    edges = np.percentile(sep, [0, 25, 50, 75, 100])
+    in_q4 = 0
+    for q in range(4):
+        lo, hi = edges[q], edges[q + 1]
+        m = (sep >= lo) & (sep <= hi if q == 3 else sep < hi)
+        if not m.any():
+            continue
+        f = int((~ok_mask[m]).sum())
+        if q == 3:
+            in_q4 = f
+        res['quartiles'].append((q + 1, lo, hi, int(m.sum()), f))
+
+    res['alt'] = Counter(tuple(sorted(map(tuple, map(sorted, b))))
+                         for b, g in zip(best_per_box, ok_mask) if not g)
+    res['top_share'] = res['alt'].most_common(1)[0][1] / n_fail
+    res['q4_share'] = in_q4 / n_fail
+
+    # A sub-1% shortfall is noise -- real sets carry a few genuinely odd
+    # boxes -- and must not be escalated into an inconclusive verdict.
+    if res['frac_ok'] >= 0.99:
+        res['verdict'] = 'ok'
+    elif n_fail < 30:
+        res['verdict'] = 'too_few'
+    elif res['q4_share'] > 0.6 and res['top_share'] < 0.5:
+        res['verdict'] = 'geometry'
+    elif res['top_share'] > 0.7 and res['q4_share'] < 0.5:
+        res['verdict'] = 'renumbering'
+    else:
+        res['verdict'] = 'inconclusive'
+    return res
+
+
+VERDICT_TEXT = {
+    'ok': 'convention confirmed on every box.',
+    'geometry': ('GEOMETRY. Failures track how open the flaps are and scatter '
+                 'across many\n         alternatives. The convention is fine; '
+                 'the set is just wide.'),
+    'renumbering': ('RENUMBERING. One alternative dominates and it is not tied '
+                    'to how open the\n         flaps are -- a systematic index '
+                    'permutation. Do NOT pretrain on this.'),
+    'inconclusive': ('INCONCLUSIVE. Overlay a few failing boxes before '
+                     'committing a pretrain.'),
+    'too_few': 'too few failures to call confidently; see the concentration above.',
+}
+
+
 def report(name, path):
     boxes, cats = load(path)
     print(f'\n{"=" * 72}\n{name}   ({len(boxes)} fully-visible boxes)\n{"=" * 72}')
@@ -89,85 +170,31 @@ def report(name, path):
         print('  declared names : (none in file)')
 
     # --- 1. which pairing actually marks the physical corners ----------------
-    votes, assumed_rank, best_per_box = Counter(), [], []
-    for k in boxes:
-        d = np.linalg.norm(k[:, None, :] - k[None, :, :], axis=-1)
-        totals = np.array([sum(d[i, j] for i, j in m) for m in MATCHINGS])
-        best = MATCHINGS[int(totals.argmin())]
-        best_per_box.append(best)
-        votes[best] += 1
-        ours = sum(d[i, j] for i, j in PAIRS)
-        assumed_rank.append(int((totals < ours - 1e-9).sum()) + 1)
-
+    c = classify_convention(boxes)
     print('\n  1. PAIRING  (minimum-total-distance matching, per box)')
-    for m, n in votes.most_common(3):
+    for m, n in c['votes'].most_common(3):
         tag = '  <-- our convention' if set(map(frozenset, m)) == set(
             map(frozenset, PAIRS)) else ''
-        print(f'     {n:>6} boxes ({n / len(boxes):>5.1%})  '
+        print(f'     {n:>6} boxes ({n / c["n"]:>5.1%})  '
               f'{tuple(tuple(p) for p in m)}{tag}')
-    rank = np.array(assumed_rank)
-    print(f'     our pairing ranks #1 in {(rank == 1).mean():>5.1%} of boxes '
-          f'(median rank {int(np.median(rank))} of {len(MATCHINGS)})')
+    print(f'     our pairing ranks #1 in {c["frac_ok"]:>5.1%} of boxes '
+          f'(median rank {int(np.median(c["rank"]))} of {len(MATCHINGS)})')
 
     # --- 1b. is a shortfall RENUMBERING or just WIDE GEOMETRY? --------------
-    # The minimum-distance test assumes the two keypoints at one corner are
-    # closer to each other than to anything else. Splay the flaps far enough
-    # and that stops being true WITHOUT any relabelling -- so a shortfall is
-    # only evidence of renumbering if it is spread evenly across geometry.
-    #
-    #   failures concentrated in the widest boxes  -> geometry, set is fine
-    #   failures flat across separation            -> indices are scrambled
-    #
-    # A systematic renumbering also makes ONE alternative pairing win nearly
-    # every failure; genuine wide geometry scatters them.
-    ok_mask = rank == 1
-    n_fail = int((~ok_mask).sum())
-    if n_fail:
-        sep = np.array([
-            np.mean([np.linalg.norm(k[j] - k[i]) for i, j in PAIRS])
-            / max(np.sqrt(np.ptp(k[:, 0]) * np.ptp(k[:, 1])), 1e-6)
-            for k in boxes])
+    if c['n_fail']:
         print(f'\n  1b. IS THE SHORTFALL GEOMETRY OR RENUMBERING?  '
-              f'({n_fail} failures)')
-        edges = np.percentile(sep, [0, 25, 50, 75, 100])
+              f'({c["n_fail"]} failures)')
         print('      separation quartile        n    fail rate   share of fails')
-        in_q4 = 0
-        for q in range(4):
-            lo, hi = edges[q], edges[q + 1]
-            m = (sep >= lo) & (sep <= hi if q == 3 else sep < hi)
-            if not m.any():
-                continue
-            fails = int((~ok_mask[m]).sum())
-            if q == 3:
-                in_q4 = fails
-            print(f'      Q{q + 1}  {lo:>6.3f}-{hi:<7.3f}{m.sum():>7}'
-                  f'{fails / m.sum():>11.1%}{fails / n_fail:>15.1%}')
-
-        alt = Counter(tuple(sorted(map(tuple, map(sorted, b))))
-                      for b, good in zip(best_per_box, ok_mask) if not good)
-        top_share = alt.most_common(1)[0][1] / n_fail
-        q4_share = in_q4 / n_fail
-        print(f'\n      {q4_share:.0%} of failures are in the WIDEST quartile '
-              f'(25% would be chance)')
-        print(f'      most common alternative accounts for {top_share:.0%} '
+        for q, lo, hi, n, f in c['quartiles']:
+            print(f'      Q{q}  {lo:>6.3f}-{hi:<7.3f}{n:>7}'
+                  f'{f / n:>11.1%}{f / c["n_fail"]:>15.1%}')
+        print(f'\n      {c["q4_share"]:.0%} of failures are in the WIDEST '
+              f'quartile (25% would be chance)')
+        print(f'      most common alternative accounts for {c["top_share"]:.0%} '
               f'of failures')
-        for m, n in alt.most_common(2):
-            print(f'        {n:>6} ({n / n_fail:>5.1%})  {m}')
-
-        if n_fail < 30:
-            print('\n      -> too few failures to call confidently, but see '
-                  'the concentration above.')
-        elif q4_share > 0.6 and top_share < 0.5:
-            print('\n      -> GEOMETRY. Failures track how open the flaps are '
-                  'and scatter across\n         many alternatives. The '
-                  'convention is fine; the set is just wide.')
-        elif top_share > 0.7 and q4_share < 0.5:
-            print('\n      -> RENUMBERING. One alternative dominates and it is '
-                  'not tied to how\n         open the flaps are -- a '
-                  'systematic index permutation. Do NOT pretrain.')
-        else:
-            print('\n      -> INCONCLUSIVE. Overlay a few failing boxes before '
-                  'committing a pretrain.')
+        for m, n in c['alt'].most_common(2):
+            print(f'        {n:>6} ({n / c["n_fail"]:>5.1%})  {m}')
+        print(f'\n      -> {VERDICT_TEXT[c["verdict"]]}')
 
     # --- 2. normalisation sanity --------------------------------------------
     ptp = np.array([[np.ptp(k[:, 0]), np.ptp(k[:, 1])] for k in boxes])
