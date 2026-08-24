@@ -5,6 +5,12 @@ validation, which on a 100-epoch pretrain is ten epochs in. This answers the
 same questions in seconds, without a GPU or a checkpoint.
 
 WHAT IT CHECKS
+  0. REGISTRY every evaluator and val transform actually BUILDS through the
+              registry, with the config's own custom_imports applied. Importing
+              a metric class directly proves nothing: mmengine resolves it by
+              name, and a module missing from custom_imports fails at
+              build_val_loop -- after the model is built and an MLflow run has
+              been opened.
   1. FILES    every val ann_file exists and parses; a sample of color and
               depth images resolve where LoadRGBDImage will look for them.
   2. ROUTING  each val image is pushed through the metric's OWN _route(), so
@@ -23,6 +29,7 @@ Usage:
     python scripts/verify_val_setup.py configs/<config>.py [--samples 40]
 """
 import argparse
+import copy
 import json
 import os.path as osp
 import sys
@@ -91,6 +98,43 @@ def main():
     args = p.parse_args()
 
     cfg = Config.fromfile(args.config)
+
+    # ---- 0. registry ------------------------------------------------------
+    print('0. REGISTRY')
+    from mmengine.registry import init_default_scope
+    from mmengine.utils import import_modules_from_strings
+    from mmpose.registry import METRICS, TRANSFORMS
+
+    init_default_scope(cfg.get('default_scope', 'mmpose'))
+    ci = cfg.get('custom_imports')
+    if ci:
+        import_modules_from_strings(**ci)
+    check('config declares custom_imports', bool(ci),
+          '' if ci else
+          'none declared -- custom metrics/transforms will not resolve',
+          fatal=False)
+
+    _evs = cfg.val_evaluator if isinstance(cfg.val_evaluator, list) \
+        else [cfg.val_evaluator]
+    for e in _evs:
+        name = e['type']
+        try:
+            METRICS.build(copy.deepcopy(e))
+            check(f'{name} builds', True)
+        except KeyError as err:
+            check(f'{name} builds', False,
+                  f'not registered -- add its module to custom_imports '
+                  f'({str(err)[:60]})')
+        except Exception as err:                       # noqa: BLE001
+            # Registered but unhappy (e.g. a missing ann_file). Still worth
+            # reporting, but it is a different failure from a missing import.
+            check(f'{name} builds', False,
+                  f'{type(err).__name__}: {str(err)[:80]}', fatal=False)
+
+    _pipe = cfg.val_dataloader['dataset'].get('pipeline') or []
+    unreg = [s['type'] for s in _pipe if s['type'] not in TRANSFORMS]
+    check('every val transform is registered', not unreg, f'missing: {unreg}')
+
     val_subs = subsets(cfg.val_dataloader)
     train_subs = subsets(cfg.train_dataloader)
     print(f'config : {args.config}')

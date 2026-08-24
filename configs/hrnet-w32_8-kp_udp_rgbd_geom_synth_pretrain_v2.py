@@ -107,6 +107,22 @@ old_synth_val = 'annotations/person_keypoints_synth_only_valsplit.json'
 
 metainfo_file = 'configs/_base_/datasets/RSC_Keypoints.py'
 
+# The pretrain chain registers the custom transforms, preprocessor, loss and
+# MLflow backend, but NOT the multi-domain metrics -- those were only ever
+# pulled in by the chewy finetune config. Stage 1 now uses them too, and an
+# unregistered metric fails at build_val_loop, i.e. AFTER the model is built
+# and an MLflow run has been opened.
+custom_imports = dict(
+    imports=[
+        'mmpose.datasets.transforms.rgbd',
+        'mmpose.models.data_preprocessors.nchannel',
+        'mmpose.models.losses.geometric_loss',
+        'mmpose.engine.vis_backends.safe_mlflow',
+        'mmpose.evaluation.metrics.multi_domain_coco_metric',
+        'mmpose.evaluation.metrics.multi_domain_distance_metric',
+    ],
+    allow_failed_imports=False)
+
 # POST-SPLIT annotation counts (400 images held out of each by
 # scripts/make_synth_val_split.py --n 400). Used only to size the loss warmup
 # below; an out-of-date number changes when the geometric loss ramps in, which
