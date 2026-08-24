@@ -155,12 +155,22 @@ def main():
         ('% pairs above 0.180', (cand > 0.180).mean() * 100, 3.0, 8.0, '%'),
         ('coefficient of variation', cand.std() / cand.mean(), 0.70, 1.05, ''),
     ]
-    ok = True
+    ok, n_high, n_low = True, 0, 0
     for label, value, lo, hi, unit in checks:
         good = lo <= value <= hi
         ok &= good
+        # Direction matters: overshooting the target is a DIFFERENT failure
+        # from undershooting it, and needs the opposite correction.
+        if good:
+            verdict = 'PASS'
+        elif value > hi:
+            verdict, _ = f'TOO HIGH ({value / hi:.1f}x)', n_high
+            n_high += 1
+        else:
+            verdict = 'TOO LOW'
+            n_low += 1
         print(f'  {label:<28}{value:>8.2f}{unit}   target {lo}-{hi}{unit}   '
-              f'{"PASS" if good else "WARN"}')
+              f'{verdict}')
 
     # how much of real geometry the candidate now supports
     hi99 = np.percentile(cand, 99)
@@ -168,7 +178,30 @@ def main():
     print(f'\n  candidate p99 = {hi99:.3f}')
     print(f'  {beyond:.1f}% of REAL pairs still fall beyond it '
           f'(was 4.0% for the old set; lower is better)')
-    print(f'\n  {"looks good — worth a pretrain" if ok and beyond < 4.0 else "distribution has NOT moved enough; regenerate before spending a pretrain"}')
+    med = float(np.median(cand))
+    real_med = float(np.median(allreal))
+    if ok and beyond < 4.0:
+        print('\n  looks good -- worth a pretrain')
+    elif n_high and not n_low:
+        # Everything overshot. Do NOT tell the user to widen further.
+        print(f'\n  OVERSHOT: median {med:.3f} vs real {real_med:.3f} '
+              f'({med / real_med:.1f}x). The flaps are too OPEN, not too '
+              f'closed.\n  Regenerating wider will make this worse -- the '
+              f'distribution needs to come DOWN\n  and become skewed: mostly '
+              f'closed flaps with an occasional extreme.')
+        if med > 4 * real_med:
+            print('\n  Before regenerating, rule out a convention or scale '
+                  'mismatch:\n    python scripts/diagnose_synth_pairs.py '
+                  '<candidate.json> \\\n        '
+                  'data/RSC_Keypoints_RGBD/annotations/'
+                  'person_keypoints_train.json\n  Real sets do reach 0.8 on '
+                  'rare boxes, so a high MAX alone proves nothing --\n  but a '
+                  'median past the real p99, plus a max several times any real '
+                  'one,\n  is also what a renumbered keypoint order looks '
+                  'like. Rule it out first.')
+    else:
+        print('\n  distribution has NOT moved enough; regenerate before '
+              'spending a pretrain')
 
 
 if __name__ == '__main__':
