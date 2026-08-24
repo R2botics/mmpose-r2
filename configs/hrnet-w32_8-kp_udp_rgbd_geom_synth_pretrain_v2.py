@@ -60,6 +60,27 @@ HOW TO JUDGE IT
     If slope stays at 0.70/0.08, the synthetic prior was not the mechanism and
     this joins the 0-for-5 list rather than becoming a 1-for-6.
 
+HOW TO LAUNCH
+    python tools/train.py \
+      configs/hrnet-w32_8-kp_udp_rgbd_geom_synth_pretrain_v2.py \
+      --work-dir work_dirs/hrnet_synth_pretrain_v2 \
+      --cfg-options default_hooks.checkpoint.max_keep_ckpts=3
+
+    The work-dir name is not free: the stage-2 config's `load_from` points
+    into work_dirs/hrnet_synth_pretrain_v2/, so changing one means changing
+    both.
+
+    Capping periodic checkpoints is right for STAGE 1 and wrong for stage 2.
+    Here the only checkpoint that matters is the one that transfers, and
+    sweeping pretrain epochs post-hoc would cost a full finetune each. At
+    interval 10 over 100 epochs that is 10 files x 329MB (they carry optimizer
+    state; the best_* copies are ~110MB), so the cap saves ~2GB for nothing
+    lost. Do NOT carry the flag over to the finetune -- see that config.
+
+    INCLUDE_OLD_SYNTH cannot be set via --cfg-options: it is read at config
+    PARSE time to build the dataset list, and --cfg-options merges into the
+    already-built dict. Edit the file to switch it.
+
 PREFLIGHT -- run both before launching, they take under a minute:
     python scripts/preflight_pretrain_set.py <new>/annotations/person_keypoints_train.json
     python scripts/check_synth_coverage.py   <new>/annotations/person_keypoints_train.json --compare-old

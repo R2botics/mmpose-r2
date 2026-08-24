@@ -13,6 +13,18 @@ read the run's best_coco_AP checkpoint name off MLflow or work_dirs. If the
 path is wrong mmengine raises rather than silently starting from ImageNet,
 so a typo fails loudly, but a path pointing at the OLD pretrain would not.
 
+HOW TO LAUNCH
+    python tools/train.py \
+      configs/hrnet-w32_8-kp_udp_rgbd_geom_finetune_chewy_synthv2.py \
+      --work-dir work_dirs/hrnet_chewy2_synthv2
+
+    Deliberately NO max_keep_ckpts here. Sweeping the periodic checkpoints
+    after the run is how the sigma experiment showed `max/cyclic_mean_px`
+    peaked at epoch 20 and then degraded 63% to the final epoch -- capping to
+    the last 3 would have hidden that and shipped a much worse model. At
+    interval 10 over 150 epochs it is 15 files x 329MB, about 5GB, which is
+    cheap against re-running to recover a checkpoint you deleted.
+
 WHAT TO COMPARE AGAINST  (the current shipping baseline, from the same
 finetune recipe on the old pretrain):
 
