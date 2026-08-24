@@ -54,23 +54,18 @@ def fix_file(path: Path, backup: bool, dry_run: bool) -> dict:
         ann['area'] = float(w * h)
         fixed += 1
 
-    if dry_run:
-        return {
-            'path': str(path),
-            'total': total,
-            'already_full': already_full,
-            'would_fix': fixed,
-            'wrote': False,
-        }
+    summary = {
+        'path': str(path),
+        'total': total,
+        'already_full': already_full,
+        'fixed': fixed,
+        'would_fix': fixed,
+        'wrote': False,
+        'backup': 'n/a',
+    }
 
-    if fixed == 0:
-        return {
-            'path': str(path),
-            'total': total,
-            'already_full': already_full,
-            'fixed': 0,
-            'wrote': False,
-        }
+    if dry_run or fixed == 0:
+        return summary
 
     if backup:
         bak_path = path.with_suffix(path.suffix + '.bak')
@@ -86,13 +81,8 @@ def fix_file(path: Path, backup: bool, dry_run: bool) -> dict:
     with open(path, 'w') as f:
         json.dump(data, f)
 
-    return {
-        'path': str(path),
-        'total': total,
-        'already_full': already_full,
-        'fixed': fixed,
-        'wrote': True,
-    }
+    summary['wrote'] = True
+    return summary
 
 
 def main():
