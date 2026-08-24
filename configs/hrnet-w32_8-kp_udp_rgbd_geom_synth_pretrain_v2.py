@@ -63,19 +63,24 @@ HOW TO JUDGE IT
 HOW TO LAUNCH
     python tools/train.py \
       configs/hrnet-w32_8-kp_udp_rgbd_geom_synth_pretrain_v2.py \
-      --work-dir work_dirs/hrnet_synth_pretrain_v2 \
-      --cfg-options default_hooks.checkpoint.max_keep_ckpts=3
+      --work-dir work_dirs/hrnet_synth_pretrain_v2
 
     The work-dir name is not free: the stage-2 config's `load_from` points
     into work_dirs/hrnet_synth_pretrain_v2/, so changing one means changing
     both.
 
-    Capping periodic checkpoints is right for STAGE 1 and wrong for stage 2.
-    Here the only checkpoint that matters is the one that transfers, and
-    sweeping pretrain epochs post-hoc would cost a full finetune each. At
-    interval 10 over 100 epochs that is 10 files x 329MB (they carry optimizer
-    state; the best_* copies are ~110MB), so the cap saves ~2GB for nothing
-    lost. Do NOT carry the flag over to the finetune -- see that config.
+    NO max_keep_ckpts, deliberately. Whether zero-shot real accuracy at
+    epoch N predicts post-FINETUNE quality has never been checked in this
+    project -- `best_coco_AP_epoch_70` was assumed, not verified. The only way
+    to find out is to finetune from more than one pretrain checkpoint, and a
+    cap of 3 throws the candidates away. 10 files x 329MB is 3.3GB, which is
+    cheap against re-running a pretrain to recover one.
+
+    RUN FIRST -- the config trains on the *_trainsplit.json files, which do
+    not exist until you make them:
+        python scripts/make_synth_val_split.py --n 400 \
+          /home/rsquared/Documents/vms_flaps_cropped/annotations/person_keypoints_train.json \
+          data/RSC_Keypoints_RGBD/annotations/person_keypoints_synth_only.json
 
     INCLUDE_OLD_SYNTH cannot be set via --cfg-options: it is read at config
     PARSE time to build the dataset list, and --cfg-options merges into the
@@ -93,18 +98,27 @@ INCLUDE_OLD_SYNTH = True
 
 # Absolute path: this set lives outside the repo's data/ tree. Edit if it moves.
 new_synth_root = '/home/rsquared/Documents/vms_flaps_cropped'
-new_synth_ann = 'annotations/person_keypoints_train.json'
+new_synth_ann = 'annotations/person_keypoints_train_trainsplit.json'
+new_synth_val = 'annotations/person_keypoints_train_valsplit.json'
 
 old_synth_root = 'data/RSC_Keypoints_RGBD'
-old_synth_ann = 'annotations/person_keypoints_synth_only.json'
+old_synth_ann = 'annotations/person_keypoints_synth_only_trainsplit.json'
+old_synth_val = 'annotations/person_keypoints_synth_only_valsplit.json'
 
 metainfo_file = 'configs/_base_/datasets/RSC_Keypoints.py'
 
-# Annotation counts, used only to size the loss warmup below. If the new set
-# grows, update N_NEW -- an out-of-date number changes when the geometric loss
-# ramps in, which is a silent training change.
-N_NEW = 11432
-N_OLD = 18530
+# POST-SPLIT annotation counts (400 images held out of each by
+# scripts/make_synth_val_split.py --n 400). Used only to size the loss warmup
+# below; an out-of-date number changes when the geometric loss ramps in, which
+# is a silent training change.
+N_NEW = 11432 - 400
+N_OLD = 18530 - 400
+
+# Real held-out sets. Stage 1 trains on ZERO real images, so all three are
+# legitimately held out here -- a luxury stage 2 does not have.
+rsc_root = 'data/RSC_Keypoints_RGBD'
+chewy_root = 'data/ChewyCrops'
+ood_root = 'data/OOD'
 
 # ------------------------------------------------------------------ pipelines
 # Redefined in full because `dataset` is replaced wholesale (CocoDataset ->
@@ -185,3 +199,98 @@ vis_backends = [
 ]
 visualizer = dict(
     type='PoseLocalVisualizer', vis_backends=vis_backends, name='visualizer')
+
+
+# ------------------------------------------------------------------ validation
+# The pretrain is judged on GENERALISATION, so it validates on every real set
+# rather than the 72-image RSC val alone:
+#
+#     RSC val     72 imgs / 180 pairs
+#     Chewy val   76 imgs / 128 pairs
+#     OOD         30 imgs / 120 pairs   <- a different capture session
+#     -------------------------------
+#                178 imgs / 428 pairs   (was 72 / 180)
+#
+# Plus a held-out slice of EACH synthetic set, which is what separates "still
+# converging" from "memorising the generator": if synthetic val keeps improving
+# while the real sets go backwards, stop.
+#
+# The synthetic domains carry `select=False`, so they are reported but can
+# never drive save_best. Selecting a pretrain on synthetic accuracy would
+# reward exactly the overfitting this split exists to detect.
+#
+# ROUTING SUBTLETY: domains are matched by img_path prefix, longest root first
+# (MultiDomain*Metric._route). The old synthetic images live UNDER the real RSC
+# tree at data/RSC_Keypoints_RGBD/images/synthetic/, so `synth_old` is routed
+# on that deeper path while `rsc` keeps the shallow root and picks up the rest.
+# The DATASET below still uses the plain rsc_root -- only the metric's routing
+# key is the deeper path.
+old_synth_route = f'{old_synth_root}/images/synthetic'
+
+val_pipeline = [
+    dict(type='LoadRGBDImage'),
+    dict(type='GetBBoxCenterScale'),
+    dict(type='TopdownAffine', input_size=(256, 256), use_udp=True),
+    dict(type='PackPoseInputs'),
+]
+
+val_dataloader = dict(
+    batch_size=16,
+    num_workers=4,
+    dataset=dict(
+        _delete_=True,
+        type='CombinedDataset',
+        metainfo=dict(from_file=metainfo_file),
+        datasets=[
+            _subset(rsc_root, 'annotations/person_keypoints_val.json'),
+            _subset(chewy_root, 'annotations/person_keypoints_Train.json'),
+            _subset(ood_root, 'annotations/person_keypoints_Test.json'),
+            _subset(new_synth_root, new_synth_val),
+            _subset(old_synth_root, old_synth_val),
+        ],
+        pipeline=val_pipeline))
+
+_val_domains = [
+    dict(name='rsc', data_root=rsc_root),
+    dict(name='chewy', data_root=chewy_root),
+    dict(name='ood', data_root=ood_root),
+    dict(name='synth_new', data_root=new_synth_root, select=False),
+    dict(name='synth_old', data_root=old_synth_route, select=False),
+]
+_val_domains_coco = [
+    dict(name='rsc', data_root=rsc_root,
+         ann_file=f'{rsc_root}/annotations/person_keypoints_val.json'),
+    dict(name='chewy', data_root=chewy_root,
+         ann_file=f'{chewy_root}/annotations/person_keypoints_Train.json'),
+    dict(name='ood', data_root=ood_root,
+         ann_file=f'{ood_root}/annotations/person_keypoints_Test.json'),
+    dict(name='synth_new', data_root=new_synth_root, select=False,
+         ann_file=f'{new_synth_root}/{new_synth_val}'),
+    dict(name='synth_old', data_root=old_synth_route, select=False,
+         ann_file=f'{old_synth_root}/{old_synth_val}'),
+]
+
+val_evaluator = [
+    dict(type='MultiDomainKeypointDistanceMetric', domains=_val_domains),
+    dict(type='MultiDomainCocoMetric', domains=_val_domains_coco),
+]
+
+# `_delete_` is required on these two: the base sets them to None, and a
+# dict-valued child would otherwise be merged into it. It must NOT appear
+# inside test_evaluator, which is a list whose elements are constructed
+# rather than merged. Same treatment as the chewy finetune config.
+test_cfg = dict(_delete_=True)
+test_dataloader = dict(_delete_=True, **val_dataloader)
+test_evaluator = val_evaluator
+
+# Two selection criteria, deliberately. `min/coco/AP` is the historical
+# continuity metric; `max/cyclic_mean_px` is the one the finetune ships on, so
+# a pretrain that already looks good there is the better bet. Both are floors
+# ("is this checkpoint broken"), not fine-grained selectors -- see the note on
+# max_keep_ckpts above for why the periodic checkpoints are kept too.
+default_hooks = dict(
+    checkpoint=dict(
+        type='CheckpointHook',
+        interval=10,
+        save_best=['min/coco/AP', 'max/cyclic_mean_px'],
+        rule=['greater', 'less']))

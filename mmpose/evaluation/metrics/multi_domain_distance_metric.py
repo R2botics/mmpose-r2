@@ -132,6 +132,15 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
         self.domain_names: List[str] = [d['name'] for d in domains]
         if len(set(self.domain_names)) != len(self.domain_names):
             raise ValueError(f'duplicate domain names: {self.domain_names}')
+        # `select=False` reports a domain but keeps it out of the max/
+        # aggregation, so it cannot drive save_best. That is what a held-out
+        # SYNTHETIC split needs: it tells you whether the run is overfitting
+        # synthetic, and it must never decide which checkpoint ships.
+        self.domain_select: List[bool] = [
+            bool(d.get('select', True)) for d in domains]
+        if not any(self.domain_select):
+            raise ValueError('at least one domain must have select=True, '
+                             'otherwise max/* is never emitted')
         self.fail_thr_px = float(fail_thr_px)
         self.ignore_out_of_bounds = bool(ignore_out_of_bounds)
         self.oob_margin_px = float(oob_margin_px)
@@ -363,14 +372,18 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
                     logger.info(f'    {err:8.1f}px  {kn:<9s} '
                                 f'{osp.basename(img_path)}')
 
-        if per_domain_mean:
-            worst = max(per_domain_mean, key=per_domain_mean.get)
-            metrics['max/mean_px'] = per_domain_mean[worst]
+        # Only selectable domains take part in the minimax.
+        selectable = {n for n, s in zip(self.domain_names, self.domain_select)
+                      if s}
+        sel_mean = {n: v for n, v in per_domain_mean.items() if n in selectable}
+        if sel_mean:
+            worst = max(sel_mean, key=sel_mean.get)
+            metrics['max/mean_px'] = sel_mean[worst]
             metrics['max/domain_index'] = float(self.domain_names.index(worst))
 
             # same minimax, but on the rotation-tolerant error
             cyc_means = {n: metrics[f'{n}/cyclic_mean_px']
-                         for n in per_domain_mean
+                         for n in sel_mean
                          if f'{n}/cyclic_mean_px' in metrics}
             if cyc_means:
                 cworst = max(cyc_means, key=cyc_means.get)

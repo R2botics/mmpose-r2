@@ -79,6 +79,13 @@ class MultiDomainCocoMetric(BaseMetric):
         self.domain_names: List[str] = [d['name'] for d in domains]
         if len(set(self.domain_names)) != len(self.domain_names):
             raise ValueError(f'duplicate domain names: {self.domain_names}')
+        # `select=False` reports a domain but keeps it out of min/coco/AP, so
+        # it cannot drive save_best -- see MultiDomainKeypointDistanceMetric.
+        self.domain_select: List[bool] = [
+            bool(d.get('select', True)) for d in domains]
+        if not any(self.domain_select):
+            raise ValueError('at least one domain must have select=True, '
+                             'otherwise min/coco/AP is never emitted')
 
         # Longest root first so nested roots (data/ChewyCrops vs
         # data/ChewyCrops2) route to the more specific one.
@@ -157,11 +164,16 @@ class MultiDomainCocoMetric(BaseMetric):
             if 'AP' in res:
                 per_domain_ap[name] = res['AP']
 
-        if per_domain_ap:
-            worst = min(per_domain_ap, key=per_domain_ap.get)
-            metrics['min/coco/AP'] = per_domain_ap[worst]
+        selectable = {n for n, s in zip(self.domain_names, self.domain_select)
+                      if s}
+        sel_ap = {n: v for n, v in per_domain_ap.items() if n in selectable}
+        if sel_ap:
+            worst = min(sel_ap, key=sel_ap.get)
+            metrics['min/coco/AP'] = sel_ap[worst]
             metrics['min/domain_index'] = float(self.domain_names.index(worst))
-            summary = '  '.join(f'{k}={v:.4f}' for k, v in per_domain_ap.items())
+            summary = '  '.join(
+                f'{k}={v:.4f}' + ('' if k in selectable else '*')
+                for k, v in per_domain_ap.items())
             logger.info(f'[MultiDomainCocoMetric] {summary}  '
                         f'-> min={per_domain_ap[worst]:.4f} (binding: {worst})')
         return metrics
