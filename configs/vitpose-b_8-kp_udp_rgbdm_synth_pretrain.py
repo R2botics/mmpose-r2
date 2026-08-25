@@ -81,6 +81,7 @@ custom_imports = dict(
         'mmpose.models.losses.geometric_loss',
         'mmpose.evaluation.metrics.multi_domain_coco_metric',
         'mmpose.evaluation.metrics.multi_domain_distance_metric',
+        'mmpose.engine.vis_backends.safe_mlflow',
     ],
     allow_failed_imports=False)
 
