@@ -133,7 +133,20 @@ def main():
 
     _pipe = cfg.val_dataloader['dataset'].get('pipeline') or []
     unreg = [s['type'] for s in _pipe if s['type'] not in TRANSFORMS]
-    check('every val transform is registered', not unreg, f'missing: {unreg}')
+    check('every val transform is registered', not unreg,
+          '' if not unreg else f'missing: {unreg}')
+
+    # The runner builds the visualizer too, and an unregistered vis_backend
+    # kills the run in build_visualizer -- before training, but AFTER the
+    # config has otherwise checked out. Checking only the evaluator missed
+    # this once already.
+    from mmpose.registry import VISBACKENDS
+
+    _vb = (cfg.get('visualizer') or {}).get('vis_backends') or []
+    missing_vb = [b['type'] for b in _vb if b['type'] not in VISBACKENDS]
+    check('every vis_backend is registered', not missing_vb,
+          '' if not missing_vb else
+          f'missing: {missing_vb} -- add the module to custom_imports')
 
     val_subs = subsets(cfg.val_dataloader)
     train_subs = subsets(cfg.train_dataloader)

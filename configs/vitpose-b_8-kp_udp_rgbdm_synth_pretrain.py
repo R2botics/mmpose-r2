@@ -69,6 +69,21 @@ HOW TO LAUNCH
 """
 _base_ = ['./vitpose-b_8-kp_udp_rgbdm.py']
 
+# `imports` is a LIST, so declaring custom_imports here REPLACES the arm's
+# rather than extending it -- every entry has to be repeated. The addition is
+# safe_mlflow: the ViT arms never logged to MLflow, so the backend this config
+# adds below was unregistered and the run died in build_visualizer.
+custom_imports = dict(
+    imports=[
+        'mmpose.models.backbones.vit',
+        'mmpose.datasets.transforms.rgbd',
+        'mmpose.models.data_preprocessors.nchannel',
+        'mmpose.models.losses.geometric_loss',
+        'mmpose.evaluation.metrics.multi_domain_coco_metric',
+        'mmpose.evaluation.metrics.multi_domain_distance_metric',
+    ],
+    allow_failed_imports=False)
+
 # ------------------------------------------------------------------ the data
 new_synth_root = '/home/rsquared/Documents/vms_flaps_cropped'
 new_synth_ann = 'annotations/person_keypoints_train_trainsplit.json'
