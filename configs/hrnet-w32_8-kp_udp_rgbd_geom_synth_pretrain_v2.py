@@ -154,14 +154,17 @@ train_pipeline = [
 ]
 
 
-def _subset(root, ann):
-    return dict(
+def _subset(root, ann, test_mode=False):
+    d = dict(
         type='CocoDataset',
         data_root=root,
         ann_file=ann,
         data_prefix=dict(img='images/'),
         metainfo=dict(from_file=metainfo_file),
         pipeline=[])          # CombinedDataset owns the pipeline
+    if test_mode:
+        d['test_mode'] = True
+    return d
 
 
 _datasets = [_subset(new_synth_root, new_synth_ann)]
@@ -250,6 +253,18 @@ val_pipeline = [
     dict(type='PackPoseInputs'),
 ]
 
+# Shared by val and test. test_mode=True is what every other evaluation set in
+# this project uses; it was missing from the completed stage-1 run, which
+# retained all images anyway (72/30/400 confirmed by the routing histogram),
+# so the epoch-30 selection is unaffected.
+_eval_subsets = [
+    _subset(rsc_root, 'annotations/person_keypoints_val.json', test_mode=True),
+    _subset(chewy_root, 'annotations/person_keypoints_Train.json', test_mode=True),
+    _subset(ood_root, 'annotations/person_keypoints_Test.json', test_mode=True),
+    _subset(new_synth_root, new_synth_val, test_mode=True),
+    _subset(old_synth_root, old_synth_val, test_mode=True),
+]
+
 val_dataloader = dict(
     batch_size=16,
     num_workers=4,
@@ -257,13 +272,7 @@ val_dataloader = dict(
         _delete_=True,
         type='CombinedDataset',
         metainfo=dict(from_file=metainfo_file),
-        datasets=[
-            _subset(rsc_root, 'annotations/person_keypoints_val.json'),
-            _subset(chewy_root, 'annotations/person_keypoints_Train.json'),
-            _subset(ood_root, 'annotations/person_keypoints_Test.json'),
-            _subset(new_synth_root, new_synth_val),
-            _subset(old_synth_root, old_synth_val),
-        ],
+        datasets=_eval_subsets,
         pipeline=val_pipeline))
 
 _val_domains = [
@@ -291,12 +300,31 @@ val_evaluator = [
     dict(type='MultiDomainCocoMetric', domains=_val_domains_coco),
 ]
 
-# `_delete_` is required on these two: the base sets them to None, and a
-# dict-valued child would otherwise be merged into it. It must NOT appear
-# inside test_evaluator, which is a list whose elements are constructed
-# rather than merged. Same treatment as the chewy finetune config.
+# `_delete_` is required at the TOP level of these two because the base sets
+# them to None. It must NOT appear on the nested `dataset`: mmengine strips
+# `_delete_` while merging a child into a base dict, and with a base of None
+# there is no merge to strip it, so it survives into CombinedDataset.__init__
+# and raises `unexpected keyword argument '_delete_'`. val_dataloader gets
+# away with the nested key precisely because it DOES have a base to merge
+# into. It must also not appear inside test_evaluator, which is a list whose
+# elements are constructed rather than merged.
+#
+# Nothing is inherited here either, so the sampler and loader flags have to be
+# spelled out -- copied from the chewy finetune config, which is the version
+# proven to work under tools/test.py.
 test_cfg = dict(_delete_=True)
-test_dataloader = dict(_delete_=True, **val_dataloader)
+test_dataloader = dict(
+    _delete_=True,
+    batch_size=16,
+    num_workers=4,
+    persistent_workers=True,
+    drop_last=False,
+    sampler=dict(type='DefaultSampler', shuffle=False, round_up=False),
+    dataset=dict(
+        type='CombinedDataset',
+        metainfo=dict(from_file=metainfo_file),
+        datasets=_eval_subsets,
+        pipeline=val_pipeline))
 test_evaluator = val_evaluator
 
 # Two selection criteria, deliberately. `min/coco/AP` is the historical
