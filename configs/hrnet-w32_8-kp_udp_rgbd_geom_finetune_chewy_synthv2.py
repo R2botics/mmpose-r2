@@ -40,8 +40,22 @@ of further widening will help -- stop and go back to the cross-view selector.
 """
 _base_ = ['./hrnet-w32_8-kp_udp_rgbd_geom_finetune_chewy.py']
 
-# TODO set to the stage-1 v2 checkpoint before launching.
-load_from = 'work_dirs/hrnet_synth_pretrain_v2/best_coco_AP_epoch_70.pth'
+# Stage 1 (run 3c6e6694) peaked at EPOCH 30 on both minimax criteria:
+# max/cyclic_mean_px 11.86 (2.4 sd better than the other six validations) and
+# min/coco/AP 0.9212, plus the best rsc/pair_sep_slope and ood/coco/AP. Every
+# later epoch is worse -- real-domain error rose monotonically from epoch 30
+# while both held-out SYNTHETIC splits kept improving, which is the generator
+# overfitting the synthetic holdout exists to expose.
+#
+# The periodic checkpoint is used rather than a best_* file so the path does
+# not depend on how mmengine sanitises a metric name containing '/'.
+#
+# Override per run instead of editing this line:
+#   --cfg-options load_from=work_dirs/hrnet_synth_pretrain_v2/epoch_40.pth
+# Epoch 40 is the CHEWY-best checkpoint (chewy/cyclic_mean_px 8.97 vs 10.08),
+# and running both is what tests whether stage-1 selection predicts
+# post-finetune quality at all -- never verified in this project.
+load_from = 'work_dirs/hrnet_synth_pretrain_v2/epoch_30.pth'
 
 vis_backends = [
     dict(type='LocalVisBackend'),
