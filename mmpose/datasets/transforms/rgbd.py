@@ -1,7 +1,9 @@
 """Transforms for RGBD pose estimation.
 
-Loads RGB image + aligned 16-bit depth, produces a 5-channel input:
-    [R, G, B, depth(uint16), mask(0 or 255)]
+Loads RGB image + aligned 16-bit depth, producing 3, 4 or 5 channels:
+    [R, G, B]                                   channels=3  (depth ablation)
+    [R, G, B, depth(uint16)]                    channels=4
+    [R, G, B, depth(uint16), mask(0 or 255)]    channels=5  (default)
 
 The mask is generated on the fly from `depth > 0`, acting as a trust signal
 that the depth value at that pixel is real (vs filtered background or sensor hole).
@@ -19,13 +21,13 @@ from .common_transforms import RandomFlip
 
 @TRANSFORMS.register_module()
 class LoadRGBDImage(BaseTransform):
-    """Load RGB + aligned depth, stack into 5-channel image.
+    """Load RGB + aligned depth, stack into a 3/4/5-channel image.
 
     Required keys:
         - img_path  (path to the color image, ending in `_cropped_color.png`)
 
     Modified keys:
-        - img       (HxWx5 float32, channel order R, G, B, depth, mask)
+        - img       (HxWx{3,4,5} float32, order R, G, B[, depth[, mask]])
         - img_shape
         - ori_shape
 
@@ -34,17 +36,46 @@ class LoadRGBDImage(BaseTransform):
         depth_suffix:  suffix used in depth filenames
         color_dir:     directory name containing color images
         depth_dir:     directory name containing depth images
+        channels:      how many channels to emit. 5 = [R,G,B,depth,mask]
+            (default, unchanged behaviour); 4 = [R,G,B,depth]; 3 = [R,G,B],
+            and the depth file is not even opened.
+
+            This exists so the depth ablation is a ONE-LINE config change that
+            keeps every other stage of the pipeline byte-identical -- same
+            crop, same affine, same augmentation RNG draw order. Swapping in
+            mmpose's stock `LoadImage` for the RGB arm would also change which
+            reader decodes the PNG and how the bbox is derived, and then a
+            difference in the numbers is no longer attributable to depth.
+
+            Note what channel 4 is FOR. Channel 3 is height above the
+            conveyor, and a zero there is three different things: background
+            outside the box, box contents below the height cutoff, and genuine
+            sensor dropout. Channel 4 does not disambiguate them either -- it
+            is exactly `depth > 0`, so it carries no information channel 3
+            does not already contain. What it buys is REPRESENTATION: a
+            network reading channel 3 alone has to spend capacity learning
+            that one particular value of a continuous input means "no
+            measurement", which a linear patch projection cannot express at
+            all. Channel 4 hands it that indicator directly. Whether that is
+            worth a channel is exactly what the 4-vs-5 ablation measures.
     """
+
+    VALID_CHANNELS = (3, 4, 5)
 
     def __init__(self,
                  color_suffix: str = '_cropped_color.png',
                  depth_suffix: str = '_aligned_depth.png',
                  color_dir: str = 'images',
-                 depth_dir: str = 'depth'):
+                 depth_dir: str = 'depth',
+                 channels: int = 5):
+        if channels not in self.VALID_CHANNELS:
+            raise ValueError(
+                f'channels must be one of {self.VALID_CHANNELS}, got {channels}')
         self.color_suffix = color_suffix
         self.depth_suffix = depth_suffix
         self.color_dir = color_dir
         self.depth_dir = depth_dir
+        self.channels = channels
 
     def transform(self, results: dict) -> dict:
         rgb_path = results['img_path']
@@ -57,6 +88,13 @@ class LoadRGBDImage(BaseTransform):
         if rgb is None:
             raise FileNotFoundError(f'Could not read color image: {rgb_path}')
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)  # HxWx3 uint8
+
+        if self.channels == 3:
+            img = np.ascontiguousarray(rgb.astype(np.float32))
+            results['img'] = img
+            results['img_shape'] = img.shape[:2]
+            results['ori_shape'] = img.shape[:2]
+            return results
 
         # Load depth (uint16, single channel)
         depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
@@ -71,15 +109,12 @@ class LoadRGBDImage(BaseTransform):
                 f'Depth shape {depth.shape} != color shape {rgb.shape[:2]} '
                 f'for {rgb_path}. Check your alignment.')
 
-        # Validity mask from depth holes (0 = hole, 255 = real depth)
-        mask = (depth > 0).astype(np.uint8) * 255
+        planes = [rgb.astype(np.float32), depth.astype(np.float32)]
+        if self.channels == 5:
+            # Validity mask from depth holes (0 = hole, 255 = real depth)
+            planes.append(((depth > 0).astype(np.uint8) * 255).astype(np.float32))
 
-        # Stack to 5-channel float32:  R, G, B, depth, mask
-        rgbdm = np.dstack([
-            rgb.astype(np.float32),
-            depth.astype(np.float32),
-            mask.astype(np.float32),
-        ])
+        rgbdm = np.dstack(planes)
 
         results['img'] = rgbdm
         results['img_shape'] = rgbdm.shape[:2]

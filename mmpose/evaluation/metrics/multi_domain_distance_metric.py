@@ -44,6 +44,27 @@ Emits per domain:  <name>/mean_px, /median_px, /p90_px, /max_px,
                    /n_over_20px, /frac_over_20px, /n_keypoints
 plus:              max/mean_px, max/domain_index
 
+and the SPAN family -- the deliverable measured directly rather than through a
+keypoint-position proxy:
+
+                   <name>/corner_span_err_px        median |pred - gt|, px
+                   <name>/corner_span_err_p90_px
+                   <name>/corner_span_err_mean_px
+                   <name>/corner_span_bias_px       SIGNED median; negative
+                                                    means separations read
+                                                    short, i.e. collapse
+                   <name>/flap_span_*               same, for flap edges
+                   <name>/cyclic_corner_span_*      under the best cyclic
+                                                    flap assignment
+plus:              max/corner_span_err_px, max/cyclic_corner_span_err_px,
+                   max/flap_span_err_px
+
+Corner spans and flap spans are both reported because "span" is ambiguous
+here. Corner-pair separation (the two keypoints marking ONE physical box
+corner) is ~0.03 of the box size; a flap edge is ~0.45-0.64 of it. A 3px error
+is noise on the second and total failure on the first, so a single pooled
+"span error" would be meaningless.
+
 Set ``report_worst`` to log the identity (image + keypoint name) of the
 largest errors each evaluation. A max error that is IDENTICAL across many
 epochs is the signature of a mislabelled ground-truth point rather than a
@@ -163,6 +184,33 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
     #: two mediocre keypoints -- which is why it needs its own counter.
     CORNER_PAIRS = ((0, 7), (1, 2), (3, 4), (5, 6))
 
+    #: The four FLAP edges -- the two corners of one flap. Reported alongside
+    #: the corner pairs because "span" is ambiguous in this project and the two
+    #: readings behave completely differently: flap spans are ~0.45-0.64 of the
+    #: box size, corner-pair separations ~0.03. An error of 3px is negligible
+    #: on the former and catastrophic on the latter.
+    FLAP_EDGES = ((0, 1), (2, 3), (4, 5), (6, 7))
+
+    @staticmethod
+    def _spans(pk, gk, m, edges):
+        """Signed span error per edge: (pred_len - gt_len) in ORIGINAL pixels.
+
+        Returned signed, not absolute. The absolute value answers "how wrong is
+        the measurement"; the sign answers "which way", and here the sign is
+        the diagnosis. A model that regresses corner separations toward the
+        population median produces a systematically NEGATIVE median on the
+        wide boxes and positive on the narrow ones, which is collapse; noise
+        produces a median near zero with a wide spread. Reporting only |.|
+        throws that distinction away.
+        """
+        out = []
+        for a, b in edges:
+            if a >= len(m) or b >= len(m) or not (m[a] and m[b]):
+                continue
+            out.append(float(np.linalg.norm(pk[b] - pk[a]) -
+                             np.linalg.norm(gk[b] - gk[a])))
+        return out
+
     def _route(self, img_path: str) -> int:
         p = osp.normpath(img_path)
         for root, idx in self._roots:
@@ -211,13 +259,13 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
                 # best of the four cyclic flap assignments. Each flap owns two
                 # consecutive keypoints, so one flap of rotation is a shift of
                 # two indices.
-                best_d, best_shift = d, 0
+                best_d, best_shift, best_pk = d, 0, pk
                 if self.report_cyclic and pk.shape[0] == 8:
                     for shift in (2, 4, 6):
                         rolled = np.roll(pk, shift, axis=0)
                         cand = np.linalg.norm(rolled[m] - gk[m], axis=-1)
                         if cand.mean() < best_d.mean():
-                            best_d, best_shift = cand, shift
+                            best_d, best_shift, best_pk = cand, shift, rolled
 
                 # corner-pair separation: (gt_sep, pred_sep, summed pair error)
                 pairs = []
@@ -231,10 +279,25 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
                                      np.linalg.norm(pk[b] - gk[b]))
                         pairs.append((gsep, psep, perr))
 
+                # Direct span error, the quantity downstream actually
+                # measures. Computed under BOTH the raw assignment and the
+                # best cyclic one, mirroring mean_px / cyclic_mean_px, because
+                # a clocked flap assignment is harmless downstream but moves
+                # every keypoint by ~one box side.
+                spans = {}
+                if pk.shape[0] == 8:
+                    spans = dict(
+                        corner=self._spans(pk, gk, m, self.CORNER_PAIRS),
+                        flap=self._spans(pk, gk, m, self.FLAP_EDGES),
+                        cyclic_corner=self._spans(best_pk, gk, m,
+                                                  self.CORNER_PAIRS),
+                        cyclic_flap=self._spans(best_pk, gk, m,
+                                                self.FLAP_EDGES))
+
                 self.results.append((idx, d.astype(np.float64), kpt_idx,
                                      data_sample['img_path'],
                                      best_d.astype(np.float64), best_shift,
-                                     n_dropped, pairs))
+                                     n_dropped, pairs, spans))
                 n_dropped = 0
 
     def compute_metrics(self, results: list) -> Dict[str, float]:
@@ -246,9 +309,13 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
         shifts = defaultdict(list)
         dropped = defaultdict(int)
         pairs_by_domain = defaultdict(list)
-        for idx, d, kpt_idx, img_path, best_d, best_shift, n_oob, prs in results:
+        spans_by_domain = defaultdict(lambda: defaultdict(list))
+        for (idx, d, kpt_idx, img_path, best_d, best_shift, n_oob, prs,
+             spans) in results:
             dropped[idx] += n_oob
             pairs_by_domain[idx].extend(prs)
+            for kind, vals in spans.items():
+                spans_by_domain[idx][kind].extend(vals)
             grouped[idx].append(d)
             cyc[idx].append(best_d)
             shifts[idx].append(best_shift)
@@ -314,6 +381,34 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
                         perr[collapsed].sum() / perr.sum())
                     if perr.sum() > 0 else 0.0,
                 })
+            # ---- direct span error, in pixels ------------------------------
+            # THE deliverable metric. Everything else in this class scores
+            # where a keypoint landed; this scores the DISTANCE BETWEEN two of
+            # them, which is what the product reports. The two can move
+            # independently: a pair that is 4px off in the same direction has
+            # a 4px keypoint error and a 0px span error, while a collapsed pair
+            # can have a modest keypoint error and a span error equal to the
+            # entire true separation.
+            #
+            # Median, not mean, per the brief -- and see `_bias_px` for the
+            # signed companion that tells collapse apart from noise.
+            for kind, key in (('corner', 'corner_span'),
+                              ('flap', 'flap_span'),
+                              ('cyclic_corner', 'cyclic_corner_span'),
+                              ('cyclic_flap', 'cyclic_flap_span')):
+                vals = np.asarray(spans_by_domain[idx].get(kind, []),
+                                  dtype=np.float64)
+                if vals.size == 0:
+                    continue
+                metrics.update({
+                    f'{name}/{key}_err_px': float(np.median(np.abs(vals))),
+                    f'{name}/{key}_err_p90_px': float(
+                        np.percentile(np.abs(vals), 90)),
+                    f'{name}/{key}_err_mean_px': float(np.abs(vals).mean()),
+                    f'{name}/{key}_bias_px': float(np.median(vals)),
+                    f'{name}/n_{key}s': float(vals.size),
+                })
+
             if self.ignore_out_of_bounds:
                 metrics[f'{name}/n_gt_out_of_bounds'] = float(dropped[idx])
                 if dropped[idx]:
@@ -390,6 +485,29 @@ class MultiDomainKeypointDistanceMetric(BaseMetric):
                 metrics['max/cyclic_mean_px'] = cyc_means[cworst]
                 metrics['max/cyclic_domain_index'] = float(
                     self.domain_names.index(cworst))
+            # Minimax on the span error too, so `save_best` can select on the
+            # deliverable directly rather than on a proxy for it. Same rule:
+            # 'less', and the WORST domain binds.
+            for key in ('corner_span_err_px', 'cyclic_corner_span_err_px',
+                        'flap_span_err_px'):
+                vals = {n: metrics[f'{n}/{key}'] for n in sel_mean
+                        if f'{n}/{key}' in metrics}
+                if not vals:
+                    continue
+                w = max(vals, key=vals.get)
+                metrics[f'max/{key}'] = vals[w]
+                metrics[f'max/{key}_domain_index'] = float(
+                    self.domain_names.index(w))
+            if 'max/corner_span_err_px' in metrics:
+                logger.info(
+                    '[MultiDomainKeypointDistanceMetric] corner-pair span '
+                    'error (median |pred-gt|, px): ' + '  '.join(
+                        f'{n}={metrics[f"{n}/corner_span_err_px"]:.2f}'
+                        f'(bias {metrics[f"{n}/corner_span_bias_px"]:+.2f})'
+                        for n in per_domain_mean
+                        if f'{n}/corner_span_err_px' in metrics) +
+                    f'  -> max={metrics["max/corner_span_err_px"]:.2f}px')
+
             summary = '  '.join(
                 f'{n}={metrics[f"{n}/mean_px"]:.2f}px'
                 f'(med {metrics[f"{n}/median_px"]:.2f},'
