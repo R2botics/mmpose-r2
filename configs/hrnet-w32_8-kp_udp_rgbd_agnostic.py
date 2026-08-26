@@ -73,18 +73,44 @@ rsc_root = 'data/RSC_Keypoints_RGBD'
 chewy_root = 'data/ChewyCrops2'
 chewy_val_root = 'data/ChewyCrops'
 
+# HEATMAP RESOLUTION IS NOT A FREE CHOICE HERE, unlike in the cardinal model.
+# With one channel per keypoint, two corners 1.6 heatmap px apart are simply
+# two channels and always separable. With ONE shared channel they have to
+# survive as two distinct local maxima on a discrete grid, and measured
+# directly on this codec the smallest separation that yields all 8 peaks is:
+#
+#     heatmap  sigma  nms    resolves at        real corner separation
+#          64    any    5       11.5 px         median  6.5 px
+#          64    any    3        7.5 px         p90    11.8 px
+#         128    any    3        4.0 px
+#
+# At 64x64 MORE THAN HALF of all real corner pairs cannot be represented as
+# two peaks at all, whatever the model learns -- the first run of this config
+# lost 45% of labelled corners to exactly that. Sigma does not enter into it:
+# 1.0, 1.5 and 2.0 give identical thresholds, because the limit is grid
+# spacing and the suppression window, not blob width. (That is also an
+# independent explanation for the sigma=1.5 experiment coming back null.)
+#
+# So this arm runs at 128x128, which puts the threshold below the median.
+# HRNet's stride-4 branch emits 64x64, so one deconv layer is added to reach
+# it -- an extra ~0.9M params the cardinal baseline does not have. That is a
+# confound on parameter count, but a far smaller one than measuring an
+# experiment through a decoder that discards half the ground truth.
 codec = dict(
     type='AgnosticUDPHeatmap',
     input_size=(256, 256),
-    heatmap_size=(64, 64),
+    heatmap_size=(128, 128),
     sigma=2,
     max_keypoints=8,
     score_thr=0.1,
-    nms_kernel=5)
+    nms_kernel=3)
 
 model = dict(
     head=dict(
         out_channels=1,
+        # 64x64 -> 128x128, so the codec above can resolve close corner pairs.
+        deconv_out_channels=(32, ),
+        deconv_kernel_sizes=(4, ),
         decoder=codec,
         loss=dict(
             _delete_=True,
