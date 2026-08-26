@@ -91,7 +91,12 @@ class AgnosticUDPHeatmap(BaseKeypointCodec):
 
         # One channel, so one weight: supervise the map whenever any corner is
         # labelled. Zero only for a frame with nothing visible at all.
-        weight = np.array([float(kpt_weights.max())], dtype=np.float32)
+        #
+        # Shape MUST be (N, K) = (1, 1), matching UDPHeatmap's (1, K). The head
+        # concatenates these across the batch, so a (1,) here becomes (B,) and
+        # KeypointMSELoss rejects it -- it requires ndim 2 or 4. A test that
+        # adds the batch dimension by hand will not catch that.
+        weight = np.array([[float(kpt_weights.max())]], dtype=np.float32)
         return dict(heatmaps=merged, keypoint_weights=weight)
 
     def _peaks(self, hm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
