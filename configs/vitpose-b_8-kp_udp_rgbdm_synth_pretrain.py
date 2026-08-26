@@ -58,14 +58,21 @@ HOW TO LAUNCH
       configs/vitpose-b_8-kp_udp_rgbdm_synth_pretrain.py \\
       --work-dir work_dirs/vitpose_synth_pretrain
 
-    BATCH SIZE is 32 to match the HRNet pretrain. ViT-B at 256x256 needs
-    roughly 2-3x HRNet-W32's activation memory (HRNet ran at 6.6GB), so if it
-    OOMs, drop to 16 -- but then iters/epoch doubles to 1823 and BOTH
-    `warmup_steps` (-> 91150) and the LinearLR `end` (-> 4000) must double with
-    it, or the schedule silently means something different.
-    `use_checkpoint=True` on the backbone is the cheaper fix: it trades ~30%
-    step time for a large activation-memory saving and leaves the schedule
-    alone.
+    ADD `--amp`. The training GPU is 7.63 GiB; HRNet-W32 already used 6.6 of
+    it at batch 32, and ViT-B at batch 32 OOMs outright. What fits is batch 16
+    plus gradient checkpointing (set below) plus mixed precision:
+
+        python tools/train.py <this config> \
+          --work-dir work_dirs/vitpose_synth_pretrain --amp
+
+    Both schedules are DERIVED from BATCH_SIZE now -- `warmup_steps` and the
+    LinearLR `end` -- so changing it alone is safe. That was a live footgun:
+    at batch 16 iters/epoch is 1823, and a hard-coded 2000-iteration warmup
+    would have meant something completely different from what it says.
+
+    If it still OOMs, batch 8 is next; the schedules follow automatically.
+    If that is too slow, ViT-S (embed_dim 384, depth 12) is the honest answer
+    on 7.6 GiB -- ViT-B on this card is marginal by design.
 """
 _base_ = ['./vitpose-b_8-kp_udp_rgbdm.py']
 
@@ -104,7 +111,7 @@ metainfo_file = 'configs/_base_/datasets/RSC_Keypoints.py'
 # schedules below; an out-of-date number changes them silently.
 N_NEW = 11432 - 400
 N_OLD = 18530 - 400
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 _n_samples = N_NEW + N_OLD
 _iters_per_epoch = _n_samples // BATCH_SIZE          # 911
 
@@ -209,13 +216,20 @@ train_cfg = dict(by_epoch=True, max_epochs=100, val_interval=10)
 
 # Geometric loss ramps 0 -> 1 over the first HALF of training. The arm's 200
 # was sized for 288 images; recomputed here or it would finish by epoch 11.
-model = dict(head=dict(loss=dict(warmup_steps=_iters_per_epoch * 50)))
+model = dict(
+    # The training GPU has 7.63 GiB and HRNet-W32 already used 6.6 of it at
+    # batch 32. ViT-B does not fit without help. Gradient checkpointing
+    # recomputes activations in the backward pass instead of storing them:
+    # roughly 30% slower per step, but it is the lever that does NOT touch the
+    # schedules, unlike lowering the batch further.
+    backbone=dict(use_checkpoint=True),
+    head=dict(loss=dict(warmup_steps=_iters_per_epoch * 50)))
 
 # LinearLR end=2000 iters (~2.2 epochs), NOT the arm's 50. See the docstring:
 # a ViT taken to full LR inside 5% of one epoch is the classic silent failure.
 param_scheduler = [
     dict(type='LinearLR', start_factor=1.0e-5, by_epoch=False,
-         begin=0, end=2000),
+         begin=0, end=_iters_per_epoch * 2),
     dict(type='CosineAnnealingLR', eta_min=0, begin=0, end=100, by_epoch=True),
 ]
 
